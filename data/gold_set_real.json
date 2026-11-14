@@ -1,0 +1,157 @@
+{
+  "_about": "Hand-checked gold set of 10 REAL AI/SaaS vendors x 9 fields (Milestones 2 & 6), as of 2026-11-01. Covers clear technical passes with India residency (Zoho Desk Zia, Freshworks Freddy AI, LiveKit Cloud, Medixar AI), clear blockers on India residency or in-progress SOC 2 (Notion AI, Anthropic Claude Enterprise, OpenAI ChatGPT Enterprise, Methodical AI, Lorikeet CX), and conditional enterprise-only/on-request cases (Ringg AI).",
+  "as_of": "2026-11-01",
+  "cases": [
+    {
+      "id": "real-zoho-zia-t3",
+      "question": "Can our support team use Zoho Desk Zia to triage customer tickets?",
+      "vendor": "Zoho Desk Zia",
+      "official_domain": "zoho.com",
+      "tier": "T3",
+      "users": 40,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "PASS",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "CONDITIONAL"
+    },
+    {
+      "id": "real-freshworks-freddy-t3",
+      "question": "Can our support team use Freshworks Freddy AI for customer support tickets?",
+      "vendor": "Freshworks Freddy AI",
+      "official_domain": "freshworks.com",
+      "tier": "T3",
+      "users": 50,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "NEEDS_REVIEW",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "CONDITIONAL"
+    },
+    {
+      "id": "real-livekit-cloud-t3",
+      "question": "Can we use LiveKit Cloud for customer voice support agents?",
+      "vendor": "LiveKit Cloud",
+      "official_domain": "livekit.com",
+      "tier": "T3",
+      "users": 15,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "PASS",
+        "DP-5.4": "PASS", "SEC-7.1": "NEEDS_REVIEW", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "CONDITIONAL"
+    },
+    {
+      "id": "real-notion-ai-t3",
+      "question": "Can support store customer PII tickets in Notion AI?",
+      "vendor": "Notion AI",
+      "official_domain": "notion.so",
+      "tier": "T3",
+      "users": 30,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "FAIL", "AI-2.1": "PASS", "AI-3.4": "NEEDS_REVIEW",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "BLOCKED"
+    },
+    {
+      "id": "real-anthropic-claude-t3",
+      "question": "Can we use Anthropic Claude Enterprise with customer personal data stored in workspaces?",
+      "vendor": "Anthropic Claude Enterprise",
+      "official_domain": "anthropic.com",
+      "tier": "T3",
+      "users": 25,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "FAIL", "AI-2.1": "NEEDS_REVIEW", "AI-3.4": "PASS",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "BLOCKED"
+    },
+    {
+      "id": "real-openai-chatgpt-t3",
+      "question": "Can our operations team use OpenAI ChatGPT Enterprise for customer order disputes?",
+      "vendor": "OpenAI ChatGPT Enterprise",
+      "official_domain": "openai.com",
+      "tier": "T3",
+      "users": 45,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "FAIL", "AI-2.1": "NEEDS_REVIEW", "AI-3.4": "PASS",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "BLOCKED"
+    },
+    {
+      "id": "real-methodical-ai-t3",
+      "question": "Can we onboard Methodical AI for T3 customer support analytics?",
+      "vendor": "Methodical AI",
+      "official_domain": "methodical.ai",
+      "tier": "T3",
+      "users": 20,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "FAIL", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "PASS",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "BLOCKED"
+    },
+    {
+      "id": "real-ringg-ai-t3",
+      "question": "Can our outbound support team use Ringg AI for customer calls?",
+      "vendor": "Ringg AI",
+      "official_domain": "ringg.ai",
+      "tier": "T3",
+      "users": 18,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "NEEDS_REVIEW",
+        "DP-5.4": "PASS", "SEC-7.1": "NEEDS_REVIEW", "SEC-9.3": "PASS", "DP-2.2": "NEEDS_REVIEW", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "CONDITIONAL"
+    },
+    {
+      "id": "real-medixar-ai-t3",
+      "question": "Can we use Medixar AI to process customer support records in India?",
+      "vendor": "Medixar AI",
+      "official_domain": "medixar.ai",
+      "tier": "T3",
+      "users": 22,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "PASS", "AI-2.1": "PASS", "AI-3.4": "NEEDS_REVIEW",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "CONDITIONAL"
+    },
+    {
+      "id": "real-lorikeet-cx-t3",
+      "question": "Can we use Lorikeet CX for Indian customer support tickets?",
+      "vendor": "Lorikeet CX",
+      "official_domain": "lorikeetcx.ai",
+      "tier": "T3",
+      "users": 30,
+      "user_groups": ["public", "employees", "security"],
+      "checked_on": "2026-11-01",
+      "expected_verdicts": {
+        "SEC-4.2": "PASS", "DP-3.1": "FAIL", "AI-2.1": "PASS", "AI-3.4": "NEEDS_REVIEW",
+        "DP-5.4": "PASS", "SEC-7.1": "PASS", "SEC-9.3": "PASS", "DP-2.2": "PASS", "PROC-1.1": "NEEDS_REVIEW"
+      },
+      "expected_overall": "BLOCKED"
+    }
+  ],
+  "policy_questions": []
+}

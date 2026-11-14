@@ -1,0 +1,238 @@
+{
+  "_about": "Cached snapshots of 10 real AI/SaaS vendors (Milestones 2 & 6) so real-vendor evaluations run deterministically offline and in CI without failing when vendor trust centers rate-limit bots.",
+  "as_of_default": "2026-11-01",
+  "vendors": {
+    "Freshworks Freddy AI": {"official_domain": "freshworks.com", "legal_entity": "Freshworks Inc", "country": "United States"},
+    "Zoho Desk Zia": {"official_domain": "zoho.com", "legal_entity": "Zoho Corporation Pvt Ltd", "country": "India"},
+    "LiveKit Cloud": {"official_domain": "livekit.com", "legal_entity": "LiveKit Inc", "country": "United States"},
+    "Notion AI": {"official_domain": "notion.so", "legal_entity": "Notion Labs Inc", "country": "United States"},
+    "Anthropic Claude Enterprise": {"official_domain": "anthropic.com", "legal_entity": "Anthropic PBC", "country": "United States"},
+    "OpenAI ChatGPT Enterprise": {"official_domain": "openai.com", "legal_entity": "OpenAI OpCo LLC", "country": "United States"},
+    "Methodical AI": {"official_domain": "methodical.ai", "legal_entity": "Methodical AI Pvt Ltd", "country": "India"},
+    "Ringg AI": {"official_domain": "ringg.ai", "legal_entity": "Ringg AI Technologies Pvt Ltd", "country": "India"},
+    "Medixar AI": {"official_domain": "medixar.ai", "legal_entity": "Medixar Health Technologies Pvt Ltd", "country": "India"},
+    "Lorikeet CX": {"official_domain": "lorikeetcx.ai", "legal_entity": "Lorikeet CX Pty Ltd", "country": "Australia"}
+  },
+  "documents": [
+    {
+      "id": "R01",
+      "url": "https://www.freshworks.com/security/",
+      "title": "Freshworks Trust & Security — Freshworks Freddy AI",
+      "source_type": "official",
+      "publisher": "Freshworks Inc",
+      "published_date": "2026-08-19",
+      "last_updated": "2026-10-15",
+      "about_entity": "freshworks.com",
+      "text": "Freshworks Trust Center. Freshworks Inc holds SOC 2 Type II and ISO/IEC 27001:2022 certifications covering Freshdesk and Freddy AI. Regional data hosting is available across the United States, European Union, India (Mumbai), Australia and UAE. Customer data is never used to train foundation models. SAML 2.0 and OIDC SSO are included on Pro and Enterprise plans. Sub-processors include Amazon Web Services (hosting, India/US/EU) and Microsoft Azure OpenAI (model_provider, zero-retention). Data is deleted within 30 days of contract termination. Published DPA includes DPDP Act terms. No major customer data breaches in the past 24 months.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Freshworks Inc", "country": "United States", "hq_city": "San Mateo"}, "display": "Freshworks Inc (United States / Chennai)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-05-01", "valid_until": null, "issuer": "Independent CPA"}, {"name": "ISO 27001", "status": "certified", "date": "2025-10-01", "valid_until": "2028-10-01", "issuer": "BSI"}], "display": "SOC 2 Type II (2026-05-01) and ISO 27001 (valid to 2028-10-01)"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["India", "United States", "European Union", "Australia", "UAE"], "planned": []}, "display": "India, US, EU, Australia, UAE"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Does not train foundation models on customer data"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS", "purpose": "cloud hosting", "category": "hosting", "country": "India, US, EU"}, {"name": "Azure OpenAI", "purpose": "LLM inference", "category": "model_provider", "country": "United States"}], "display": "AWS (hosting) and Azure OpenAI (model provider)"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "Deleted within 30 days of termination or request"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SAML/OIDC SSO on Pro and Enterprise plans"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major security incidents in last 24 months"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA available"}
+      ]
+    },
+    {
+      "id": "R02",
+      "url": "https://www.zoho.com/security.html",
+      "title": "Zoho Security and Compliance — Zoho Desk Zia",
+      "source_type": "official",
+      "publisher": "Zoho Corporation Pvt Ltd",
+      "published_date": "2026-04-06",
+      "last_updated": "2026-10-20",
+      "about_entity": "zoho.com",
+      "text": "Zoho Corporation Pvt Ltd (Chennai, India) maintains ISO/IEC 27001, ISO 27701, and SOC 2 Type II certifications across Zoho Desk and Zia AI. Indian customer data is stored in Zoho's India data centers (Mumbai and Chennai). Zoho operates its own infrastructure and Zia models without sharing customer data with third-party model providers, and never trains public models on customer data. SSO (SAML 2.0) is included across plans. Data is deleted within 30 days of account termination. Standard DPA is published online. Zero major customer data breaches in the last 24 months.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Zoho Corporation Pvt Ltd", "country": "India", "hq_city": "Chennai"}, "display": "Zoho Corporation Pvt Ltd (Chennai, India)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "ISO 27001", "status": "certified", "date": "2026-02-01", "valid_until": "2029-02-01", "issuer": "BSI"}, {"name": "SOC 2 Type II", "status": "certified", "date": "2026-03-15", "valid_until": null, "issuer": "Independent Auditor"}], "display": "ISO 27001 and SOC 2 Type II certified"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["India", "United States", "European Union", "Australia"], "planned": []}, "display": "India (Mumbai/Chennai), US, EU, Australia"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Never trains models on customer data"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "Zoho Data Centers", "purpose": "self-hosted infrastructure", "category": "hosting", "country": "India"}], "display": "Self-hosted infrastructure; no third-party model providers"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days retention and deletion on request"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "all_plans", "display": "SAML SSO supported across plans"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major security incidents in last 24 months"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA online"}
+      ]
+    },
+    {
+      "id": "R03",
+      "url": "https://livekit.com/security/overview",
+      "title": "Security Overview | LiveKit Cloud",
+      "source_type": "official",
+      "publisher": "LiveKit Inc",
+      "published_date": "2026-09-01",
+      "last_updated": "2026-10-10",
+      "about_entity": "livekit.com",
+      "text": "LiveKit Cloud Security Overview. LiveKit Inc maintains SOC 2 Type II attestation. Customers can pin media routing, observability data, agent hosting, and stored data to a region: supported regions today include the United States, the European Union, and India. Sub-processors are listed at livekit.com/legal/sub-processors (cloud hosting providers only). LiveKit does not train models on customer data. Deletion within 30 days of request. SAML SSO is available on Enterprise plans. DPA is published.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "LiveKit Inc", "country": "United States", "hq_city": "San Jose"}, "display": "LiveKit Inc (United States)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-04-10", "valid_until": null, "issuer": "Independent Auditor"}], "display": "SOC 2 Type II attested (2026-04-10)"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["United States", "European Union", "India"], "planned": []}, "display": "United States, European Union, India (region pinning supported)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Does not train on customer content"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "Cloud Infrastructure Sub-processors", "purpose": "hosting", "category": "hosting", "country": "US, EU, India"}], "display": "Infrastructure sub-processors at livekit.com/legal/sub-processors"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "Deleted within 30 days"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "enterprise_only", "display": "SAML SSO on Enterprise plan"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major incidents disclosed"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R04",
+      "url": "https://trust.notion.com/documentation",
+      "title": "Notion Trust Center — Notion AI",
+      "source_type": "official",
+      "publisher": "Notion Labs Inc",
+      "published_date": "2026-11-03",
+      "last_updated": "2026-11-09",
+      "about_entity": "notion.so",
+      "text": "Notion Labs Inc undergoes annual SOC 2 Type II and ISO/IEC 27001 audits. Customer data is never used to train AI models by Notion or its sub-processors (OpenAI and Anthropic, zero data retention on Enterprise). Data residency is available in the United States and the European Union (AWS Frankfurt); India storage at rest is not available. SAML SSO is available on Business and Enterprise plans. Content is deleted within 30 days. Notion publishes a standard DPA. No major customer data breaches without post-mortem in the last 24 months.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Notion Labs Inc", "country": "United States", "hq_city": "San Francisco"}, "display": "Notion Labs Inc (United States)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-06-01", "valid_until": null, "issuer": "Independent Auditor"}, {"name": "ISO 27001", "status": "certified", "date": "2026-01-15", "valid_until": "2029-01-15", "issuer": "Independent Registrar"}], "display": "SOC 2 Type II and ISO 27001 certified"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["United States", "European Union"], "planned": []}, "display": "United States and European Union (AWS Frankfurt)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Never trains on customer data by default"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS", "purpose": "hosting", "category": "hosting", "country": "US, EU"}, {"name": "OpenAI", "purpose": "LLM inference", "category": "model_provider", "country": "United States"}, {"name": "Anthropic", "purpose": "LLM inference", "category": "model_provider", "country": "United States"}], "display": "AWS, OpenAI, Anthropic"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days deletion"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SAML SSO on Business and Enterprise"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R05",
+      "url": "https://trust.anthropic.com/",
+      "title": "Anthropic Trust Center — Claude Enterprise",
+      "source_type": "official",
+      "publisher": "Anthropic PBC",
+      "published_date": "2026-10-14",
+      "last_updated": "2026-10-20",
+      "about_entity": "anthropic.com",
+      "text": "Anthropic PBC maintains SOC 2 Type II, ISO/IEC 27001:2022, and ISO/IEC 42001:2023 certifications available via trust.anthropic.com. Commercial and Enterprise terms prohibit training models on customer data; consumer Free/Pro plans allow training unless opted out. Customer data is stored in the United States and European Union (no India storage region at rest). Sub-processors (AWS, Google Cloud) are published. Retention is 30 days by default (zero-retention available on Enterprise). SAML/OIDC SSO is included on Enterprise/Team. DPA is published.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Anthropic PBC", "country": "United States", "hq_city": "San Francisco"}, "display": "Anthropic PBC (United States)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-05-15", "valid_until": null, "issuer": "Independent Auditor"}, {"name": "ISO 27001", "status": "certified", "date": "2025-12-01", "valid_until": "2028-12-01", "issuer": "Schellman"}], "display": "SOC 2 Type II and ISO 27001:2022"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["United States", "European Union"], "planned": []}, "display": "United States and European Union"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no_on_paid_plans", "display": "No training on Commercial/Enterprise plans"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS", "purpose": "hosting", "category": "hosting", "country": "United States"}, {"name": "Google Cloud", "purpose": "hosting", "category": "hosting", "country": "United States"}], "display": "AWS and Google Cloud"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days default retention"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SSO on Team/Enterprise plans"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major unresolved incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R06",
+      "url": "https://openai.com/enterprise-privacy/",
+      "title": "OpenAI Enterprise Privacy & Trust — ChatGPT Enterprise",
+      "source_type": "official",
+      "publisher": "OpenAI OpCo LLC",
+      "published_date": "2026-08-01",
+      "last_updated": "2026-10-01",
+      "about_entity": "openai.com",
+      "text": "OpenAI OpCo LLC holds SOC 2 Type II compliance for ChatGPT Enterprise and Business. Business/Enterprise data is not used for training by default (consumer Free/Plus allows opt-out). Data residency at rest is available in the US, EU, UK, Japan, Canada, South Korea, and Singapore, but not India for full workspace storage at rest. Sub-processors (Microsoft Azure, Cloudflare) are published. Custom retention and deletion within 30 days supported. SAML SSO on Business and Enterprise. DPA is published.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "OpenAI OpCo LLC", "country": "United States", "hq_city": "San Francisco"}, "display": "OpenAI OpCo LLC (United States)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-04-01", "valid_until": null, "issuer": "Independent Auditor"}], "display": "SOC 2 Type II"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["United States", "European Union", "United Kingdom", "Japan", "Singapore"], "planned": []}, "display": "US, EU, UK, Japan, Singapore (no India storage at rest)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no_on_paid_plans", "display": "No training on Business/Enterprise"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "Microsoft Azure", "purpose": "cloud compute", "category": "hosting", "country": "United States"}], "display": "Microsoft Azure"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days deletion"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SAML SSO on Business/Enterprise"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major unresolved customer data breaches"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R07",
+      "url": "https://www.methodical.ai/trust",
+      "title": "Security, Architecture & Trust - Methodical AI",
+      "source_type": "official",
+      "publisher": "Methodical AI Pvt Ltd",
+      "published_date": "2026-09-20",
+      "last_updated": "2026-10-25",
+      "about_entity": "methodical.ai",
+      "text": "Methodical AI Trust Page. Honest Certification Roadmap: SOC 2 Type II — audit underway, certification expected in December 2026. Data Residency: Stored in India (AWS Mumbai, backups in Hyderabad). Customer data is never used to train models. Sub-processors: AWS Mumbai (hosting). Retention: deleted within 30 days of request. SAML SSO included on paid plans. DPA is published. No security incidents.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Methodical AI Pvt Ltd", "country": "India", "hq_city": "Bengaluru"}, "display": "Methodical AI Pvt Ltd (India)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "in_progress", "date": null, "valid_until": null, "issuer": "Independent CPA"}], "display": "SOC 2 Type II audit underway (expected Dec 2026)"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["India"], "planned": []}, "display": "India (AWS Mumbai, backups in Hyderabad)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Never trains on customer data"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS", "purpose": "hosting", "category": "hosting", "country": "India"}], "display": "AWS Mumbai"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days deletion"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SSO on paid plans"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R08",
+      "url": "https://www.ringg.ai/security",
+      "title": "Ringg AI Security: SOC 2 Type II, ISO 27001, HIPAA, GDPR",
+      "source_type": "official",
+      "publisher": "Ringg AI Technologies Pvt Ltd",
+      "published_date": "2026-08-10",
+      "last_updated": "2026-10-05",
+      "about_entity": "ringg.ai",
+      "text": "Ringg AI Security. Ringg AI Technologies Pvt Ltd (Bengaluru, India) is SOC 2 Type II audited (report issued May 2026) and ISO 27001 certified (valid to May 2029). Data residency in India (Mumbai) is supported for Indian enterprises. Ringg AI does not train models on customer data. Sub-processors include AWS India (hosting) and OpenAI (model_provider, zero-retention). DPA is available on request. SAML SSO is available on Enterprise plans. Retention: 30 days. No major security incidents.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Ringg AI Technologies Pvt Ltd", "country": "India", "hq_city": "Bengaluru"}, "display": "Ringg AI Technologies Pvt Ltd (India)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-05-10", "valid_until": null, "issuer": "Independent Auditor"}, {"name": "ISO 27001", "status": "certified", "date": "2026-05-10", "valid_until": "2029-05-10", "issuer": "Registrar"}], "display": "SOC 2 Type II and ISO 27001 (2026-05-10)"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["India", "United States"], "planned": []}, "display": "India (Mumbai) and United States"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Does not train on customer data"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS", "purpose": "hosting", "category": "hosting", "country": "India"}, {"name": "OpenAI", "purpose": "voice/LLM inference", "category": "model_provider", "country": "United States"}], "display": "AWS India and OpenAI"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days retention"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "enterprise_only", "display": "SSO on Enterprise only"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "on_request", "display": "DPA available on request"}
+      ]
+    },
+    {
+      "id": "R09",
+      "url": "https://medixar.ai/security/",
+      "title": "Security & Compliance - Medixar AI",
+      "source_type": "official",
+      "publisher": "Medixar Health Technologies Pvt Ltd",
+      "published_date": "2026-07-15",
+      "last_updated": "2026-09-28",
+      "about_entity": "medixar.ai",
+      "text": "Medixar Security & Compliance. ISO 27001 certified (issued Jan 2026, valid to Jan 2029) and SOC 2 Type II audited (Feb 2026). Production data for Indian customers is hosted in AWS Mumbai (ap-south-1). Sub-processors that operate outside India (OpenAI and Anthropic for AI inference, Stripe for international payments) are governed by Standard Contractual Clauses; data sent to AI providers is processed transiently and is contractually excluded from training their models. Deletion within 30 days. SAML SSO on paid plans. Published DPA.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Medixar Health Technologies Pvt Ltd", "country": "India", "hq_city": "Bengaluru"}, "display": "Medixar Health Technologies Pvt Ltd (India)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "ISO 27001", "status": "certified", "date": "2026-01-15", "valid_until": "2029-01-15", "issuer": "Registrar"}, {"name": "SOC 2 Type II", "status": "certified", "date": "2026-02-20", "valid_until": null, "issuer": "CPA"}], "display": "ISO 27001 and SOC 2 Type II"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["India"], "planned": []}, "display": "India (AWS Mumbai ap-south-1)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Contractually excluded from training"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "AWS Mumbai", "purpose": "hosting", "category": "hosting", "country": "India"}, {"name": "OpenAI", "purpose": "AI inference", "category": "model_provider", "country": "United States"}, {"name": "Anthropic", "purpose": "AI inference", "category": "model_provider", "country": "United States"}], "display": "AWS Mumbai, OpenAI, Anthropic"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days deletion"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SSO on paid plans"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    },
+    {
+      "id": "R10",
+      "url": "https://www.lorikeetcx.ai/security",
+      "title": "Lorikeet CX Security & Compliance",
+      "source_type": "official",
+      "publisher": "Lorikeet CX Pty Ltd",
+      "published_date": "2026-08-19",
+      "last_updated": "2026-10-01",
+      "about_entity": "lorikeetcx.ai",
+      "text": "Lorikeet CX Pty Ltd (Australia) holds SOC 2 Type II (issued June 2026) and ISO 27001 certifications. Hosted on Google Cloud in the United States, European Union, and Australia; India residency is not offered on standard plans. Never trains models on customer data. Sub-processors include Google Cloud and OpenAI/Anthropic (model_provider). Retention 30 days. SAML SSO on Scale and Signature plans. DPA is published.",
+      "mock_claims": [
+        {"field": "legal_entity", "evidence_level": "documented", "value": {"name": "Lorikeet CX Pty Ltd", "country": "Australia", "hq_city": "Sydney"}, "display": "Lorikeet CX Pty Ltd (Australia)"},
+        {"field": "security_certifications", "evidence_level": "documented", "value": [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-06-01", "valid_until": null, "issuer": "Auditor"}, {"name": "ISO 27001", "status": "certified", "date": "2026-03-01", "valid_until": "2029-03-01", "issuer": "Registrar"}], "display": "SOC 2 Type II and ISO 27001"},
+        {"field": "data_regions", "evidence_level": "documented", "value": {"available": ["United States", "European Union", "Australia"], "planned": []}, "display": "US, EU, Australia (no India region)"},
+        {"field": "trains_on_customer_data", "evidence_level": "documented", "value": "no", "display": "Never trains on customer data"},
+        {"field": "subprocessors", "evidence_level": "documented", "value": [{"name": "Google Cloud", "purpose": "hosting", "category": "hosting", "country": "US, EU, AU"}, {"name": "OpenAI", "purpose": "LLM inference", "category": "model_provider", "country": "United States"}], "display": "Google Cloud and OpenAI"},
+        {"field": "data_retention", "evidence_level": "documented", "value": {"default_days": 30, "deletion_on_request_days": 30}, "display": "30 days deletion"},
+        {"field": "sso_saml", "evidence_level": "documented", "value": "paid_plans", "display": "SAML SSO on Scale/Signature"},
+        {"field": "security_incidents", "evidence_level": "documented", "value": [], "display": "No major incidents"},
+        {"field": "dpa_available", "evidence_level": "documented", "value": "yes", "display": "Published DPA"}
+      ]
+    }
+  ]
+}

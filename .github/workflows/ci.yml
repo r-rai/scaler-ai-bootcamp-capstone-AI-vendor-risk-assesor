@@ -1,0 +1,23 @@
+name: Vendor Risk Assessor CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test-and-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run unit, routing, and red-team test suite
+        run: python -m pytest -q
+      - name: Run strict evaluation & component ablations
+        run: python eval/run_eval.py --strict --real --ablations
