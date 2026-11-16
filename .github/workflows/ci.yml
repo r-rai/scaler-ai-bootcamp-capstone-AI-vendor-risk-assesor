@@ -2,8 +2,13 @@ name: Vendor Risk Assessor CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, prod-hardening]
   pull_request:
+
+# Mock/offline is the default everywhere below: no job needs a model key, a GPU or the live web.
+env:
+  LLM_PROVIDER: mock
+  SEARCH_PROVIDER: offline
 
 jobs:
   test-and-eval:
@@ -21,3 +26,80 @@ jobs:
         run: python -m pytest -q
       - name: Run strict evaluation & component ablations
         run: python eval/run_eval.py --strict --real --ablations
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                  # gitleaks scans history, not just the tip
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Known-vulnerability scan of the pinned runtime dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip-audit -r requirements-prod.lock --disable-pip --no-deps
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Same tests with the production requirements and the real embedder + cross-encoder instead of the builtin ones.
+  # The same checks pass locally on the real backend (all tests + strict eval); this job has not run on GitHub yet.
+  prod-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-bge-small-ms-marco-v1
+      - name: Install production requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-prod.lock
+      - name: Fetch the embedder and reranker (cached between runs)
+        env:
+          HF_HUB_DISABLE_XET: "1"
+        run: |
+          python - <<'PY'
+          from assessor.config import SETTINGS
+          from fastembed import TextEmbedding
+          from fastembed.rerank.cross_encoder import TextCrossEncoder
+          TextEmbedding(model_name=SETTINGS.embed_model, cache_dir=SETTINGS.fastembed_cache)
+          TextCrossEncoder(model_name=SETTINGS.rerank_model, cache_dir=SETTINGS.fastembed_cache)
+          PY
+      - name: Tests on the real backend (a missing model fails here instead of silently using builtin)
+        env:
+          VRA_MODEL_DOWNLOAD: "0"
+        run: |
+          python - <<'PY'
+          from assessor.rag_core import DenseEmbedder, get_reranker
+          e, r = DenseEmbedder().backend, get_reranker().backend
+          print(e, r)
+          assert e.startswith("fastembed") and r.startswith("fastembed"), "real models were not loaded"
+          PY
+          python -m pytest -q
+          python eval/run_eval.py --strict --real --ablations
+
+  # UNVERIFIED: Docker is not installed on the development machine, so this has never been run. Expect to fix it.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t vendor-risk-assessor:ci .
+      - run: docker compose config --quiet

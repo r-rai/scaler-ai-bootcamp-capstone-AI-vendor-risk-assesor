@@ -83,6 +83,10 @@ class Settings:
     embed_model: str = field(default_factory=lambda: _env("EMBED_MODEL", "BAAI/bge-small-en-v1.5"))
     reranker: str = field(default_factory=lambda: _env("RERANKER", "auto").lower())
     rerank_model: str = field(default_factory=lambda: _env("RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2"))
+    # A stalled Hugging Face download must never hang startup, /ready or the tests: models are loaded from the
+    # local cache first; a missing model is downloaded in a thread with this deadline, then we fall back to builtin.
+    model_download: bool = field(default_factory=lambda: _env("VRA_MODEL_DOWNLOAD", "1").lower() in ("1", "true", "yes"))
+    model_load_timeout_s: float = field(default_factory=lambda: _env_float("VRA_MODEL_LOAD_TIMEOUT_S", 90.0))
     # fastembed otherwise caches in the system temp dir, which a reboot or `wsl --shutdown` wipes.
     fastembed_cache: str = field(default_factory=lambda: _env(
         "FASTEMBED_CACHE_PATH", str(Path.home() / ".cache" / "fastembed")))

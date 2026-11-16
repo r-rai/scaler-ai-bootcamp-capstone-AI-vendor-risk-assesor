@@ -269,6 +269,7 @@ def main(argv=None) -> int:
         for r in pqs["rows"]:
             lines.append(f"| {r['question']} | {r['known_to_fail']} | {r['checks']} |")
 
+    real_res = None
     if a.real or GOLD_SET_REAL.exists():
         real_gold = json.loads(GOLD_SET_REAL.read_text(encoding="utf-8"))
         real_res = run_cases(pipe, real_gold)
@@ -306,6 +307,15 @@ def main(argv=None) -> int:
     print(report)
     print(f"\nWritten to {out / 'eval_report.md'}")
     failed = [m for m, ok in status.items() if not ok]
+    # Keep every scorecard so quality drift across runs, prompts and models is visible (db.get_eval_history).
+    from assessor.db import save_eval_run
+    save_eval_run(Path(a.gold).name, SETTINGS.llm_provider, not failed, {
+        **{k: round(res[k], 4) for k in ("verdict_accuracy", "overall_accuracy", "guess_rate", "safety", "reason_faithfulness")},
+        "policy_qa_hard": round(pqs["policy_qa_hard"], 4), "policy_qa_soft": round(pqs["policy_qa_soft"], 4),
+        "real_verdict_accuracy": round(real_res["verdict_accuracy"], 4) if real_res else None,
+        "cost_usd": round(res["cost_usd"], 5), "wall_s": round(time.time() - t0, 1),
+        "embedder": SETTINGS.embedder, "reranker": SETTINGS.reranker, "failed": failed,
+    })
     if a.strict and failed:
         print(f"\nFAILED thresholds: {failed}")
         return 1

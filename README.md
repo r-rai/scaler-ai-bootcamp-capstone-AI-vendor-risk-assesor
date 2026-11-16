@@ -76,7 +76,9 @@ Then assess a **real** vendor:
 python run_assessor.py "Can our support team use <Tool> for ticket summaries?" --vendor "<Tool>" --domain <vendor.com> --tier T3 --users 35 --max-usd 0.30
 ```
 
-Live mode is a *baseline*: sequential, unplanned, one model. Making it good is the project (Milestone 2).
+Live research is an iterative loop (plan → parallel workers → identity/injection gates → merge → evaluate) that streams pages
+through extraction and stops at `VRA_MAX_SECONDS` (default 90), returning whatever it has finished; facts it did not
+establish are reported UNKNOWN. See section 6 for the service, models, caches and measured numbers.
 
 ## 4. The code, in reading order
 
@@ -100,7 +102,7 @@ data/
   gold_set.json       hand-checked expected verdicts (5 cases) + policy questions
   gold_set_template.json   fill this for REAL vendors
 eval/run_eval.py      the scorecard
-tests/                70 tests
+tests/                run `python -m pytest -q`
 app/api.py, app/ui.py FastAPI + Streamlit skeletons (Milestone 5)
 ```
 
@@ -118,3 +120,43 @@ the course module/lab to use.
 7. **Humans approve.** The report ends in an approval block that only a named person can fill.
 
 All companies, people, domains and documents in `data/` are fictional and were written for this course.
+
+## 6. Running it as a service (production hardening)
+
+Branch `prod-hardening`. Every setting is documented in `.env.example`; mock/offline stays the default, so CI and the
+demo need no key, network or GPU.
+
+**What was added.** Hashed-token auth and role-checked, multi-signature approvals (T3 needs Head of InfoSec and DPO;
+the requester cannot approve; BLOCKED cannot be approved); a hash-chained audit log (`scripts/verify_audit.py`);
+provenance stamp on every report; per-role model routing with a circuit breaker; SQLite caches (embeddings, search,
+pages, validated LLM output, and a semantic cache for policy questions only, scoped by ACL and corpus hash); a real
+cross-encoder reranker; SSRF-safe fetching; a shared prompt-injection scanner plus an optional local ONNX classifier;
+JSON logs, Prometheus metrics, OpenTelemetry spans and a cost table.
+
+**Local models** (GTX 1650, 4 GB): `scripts/setup_models.sh` downloads them, `scripts/serve_local_llm.sh` serves the
+small-role model with llama.cpp. Bake-off winner Qwen3-4B-Instruct-2507 Q4_K_M (about 3.1 GB VRAM) scored 30/30 routing,
+18/18 injection, 33/33 identity and 8/8 grader cases; Phi-4-mini scored 28/30 on routing. The injection classifier
+(protectai deberta-v3 ONNX) catches blatant attacks but misses paraphrases and once flagged a clean page, so it is an
+extra layer at a 0.99 threshold, never the only one. Verdicts never come from a model: `matcher.py` is rules only.
+
+**Model files.** The embedder and reranker are read from `~/.cache/fastembed` (override `FASTEMBED_CACHE_PATH`), not
+`/tmp`. A model that is not cached is downloaded with a deadline (`VRA_MODEL_LOAD_TIMEOUT_S`), and the builtin backend is
+used if that stalls, so a bad network cannot hang startup or `/ready`. If large downloads stall at 0 bytes, set
+`HF_HUB_DISABLE_XET=1` (what `setup_models.sh` does by default).
+
+**Measured live run** (Zoho Desk Zia, T3, 35 users; MiniMax main and extract, local Qwen for small roles, ddgs search,
+caches off, builtin embedder and reranker, 2026-11-17, residential network): two clean runs took 78 s and 73 s wall-clock
+and read 8 and 9 pages for 5 and 6 facts. Both stopped on the time limit rather than finishing every sub-question. A
+run that shared the network with a model download took 100 s and 3 pages, which is why the numbers above are the clean
+ones. The overall outcome differed between the two runs (BLOCKED, then CONDITIONAL) because the live web returned
+different pages; for the same facts the matcher always gives the same verdicts. DuckDuckGo from this network times out
+on roughly half of the queries; Tavily (`SEARCH_PROVIDER=tavily`, free credits) is the better primary where a key is
+available. No live accuracy figure against `data/gold_set_real.json` has been measured yet.
+
+**Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
+(Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**: Docker is not
+installed on the development machine. Treat them as untested until `docker compose --profile obs up` has been run.
+
+**Checks.** `LLM_PROVIDER=mock SEARCH_PROVIDER=offline python -m pytest -q`, also with `EMBEDDER=builtin RERANKER=builtin`,
+then `python eval/run_eval.py --strict --real --ablations`.
+

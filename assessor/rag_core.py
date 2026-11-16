@@ -15,6 +15,7 @@ import hashlib
 import math
 import re
 import threading
+import time
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -63,6 +64,45 @@ EMBED_STATS = {"hits": 0, "misses": 0}
 _STATS_LOCK = threading.Lock()
 
 
+_LOAD_FAILED: dict[str, float] = {}
+_LOAD_RETRY_S = 600.0
+
+
+def load_fastembed(cls, **kwargs):
+    """Build a fastembed model without ever blocking on the network indefinitely.
+
+    1. Cached files only (instant, no network). 2. If the model is not cached and downloads are allowed
+    (VRA_MODEL_DOWNLOAD), download in a thread with a deadline (VRA_MODEL_LOAD_TIMEOUT_S). A stalled download raises
+    instead of hanging; the caller falls back to the builtin backend, and we do not retry for 10 minutes.
+    `scripts/setup_models.sh` pre-downloads the models so production never needs step 2.
+    """
+    key = f"{cls.__name__}:{kwargs.get('model_name')}"
+    try:
+        return cls(local_files_only=True, **kwargs)
+    except Exception:  # noqa: BLE001 — not cached yet
+        pass
+    if not SETTINGS.model_download:
+        raise RuntimeError(f"{key} is not cached and downloads are disabled (VRA_MODEL_DOWNLOAD=0)")
+    failed_at = _LOAD_FAILED.get(key)
+    if failed_at is not None and time.monotonic() - failed_at < _LOAD_RETRY_S:
+        raise RuntimeError(f"{key}: a recent download failed; using the builtin backend")
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["model"] = cls(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    worker = threading.Thread(target=_work, daemon=True, name="model-download")
+    worker.start()
+    worker.join(SETTINGS.model_load_timeout_s)
+    if "model" in box:
+        return box["model"]
+    _LOAD_FAILED[key] = time.monotonic()
+    raise TimeoutError(f"{key}: download did not finish in {SETTINGS.model_load_timeout_s:.0f}s") if "error" not in box else box["error"]
+
+
 class DenseEmbedder:
     """Bi-encoder embedding wrapper.
 
@@ -78,7 +118,7 @@ class DenseEmbedder:
             try:
                 from fastembed import TextEmbedding  # type: ignore[import-not-found]
 
-                self._model = TextEmbedding(model_name=SETTINGS.embed_model, cache_dir=SETTINGS.fastembed_cache)
+                self._model = load_fastembed(TextEmbedding, model_name=SETTINGS.embed_model, cache_dir=SETTINGS.fastembed_cache)
                 self.backend = f"fastembed:{SETTINGS.embed_model}"
             except Exception:  # noqa: BLE001
                 pass
@@ -185,7 +225,7 @@ class CrossEncoderReranker:
             try:
                 from fastembed.rerank.cross_encoder import TextCrossEncoder  # type: ignore[import-not-found]
 
-                self._model = TextCrossEncoder(model_name=SETTINGS.rerank_model, cache_dir=SETTINGS.fastembed_cache)
+                self._model = load_fastembed(TextCrossEncoder, model_name=SETTINGS.rerank_model, cache_dir=SETTINGS.fastembed_cache)
                 self.backend = f"fastembed:{SETTINGS.rerank_model}"
             except Exception:  # noqa: BLE001
                 pass

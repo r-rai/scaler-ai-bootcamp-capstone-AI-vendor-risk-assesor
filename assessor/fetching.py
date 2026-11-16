@@ -322,6 +322,29 @@ def _search_tavily(query: str, limit: int) -> list[dict]:
 
 _PROVIDERS = {"ddgs": _search_ddgs, "tavily": _search_tavily}
 
+# ddgs' own timeout is per HTTP request, and its "auto" mode tries several engines in turn, so one query measured 27 s
+# against a 10 s setting. This is the cap on the whole call; the abandoned thread finishes in the background.
+SEARCH_HARD_CAP_S = SEARCH_TIMEOUT_S + 3
+
+
+def _call_with_deadline(fn, seconds: float, *args):
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["rows"] = fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    worker = threading.Thread(target=_work, daemon=True, name="search-call")
+    worker.start()
+    worker.join(seconds)
+    if "rows" in box:
+        return box["rows"]
+    if "error" in box:
+        raise box["error"]
+    raise TimeoutError(f"search timed out after {seconds:.0f}s")
+
 
 def search_order() -> list[str]:
     """The configured provider first, then the other one as a fallback if it is usable."""
@@ -351,7 +374,7 @@ def search(query: str, limit: int, *, refresh: bool = False, budget: Any = None,
             try:
                 if budget is not None:
                     budget.charge_tool("search", provider)
-                rows = _PROVIDERS[provider](query, limit)
+                rows = _call_with_deadline(_PROVIDERS[provider], SEARCH_HARD_CAP_S, query, limit)
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 hits = [{**r, "rank": i, "query": query, "provider": provider, "retrieved_at": now} for i, r in enumerate(rows, 1)]
                 if hits:

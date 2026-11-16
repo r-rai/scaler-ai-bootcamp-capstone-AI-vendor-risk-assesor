@@ -16,14 +16,16 @@ python run_assessor.py "<question>" --tier T3 --users 35 [--groups public,employ
 python -m pytest -q                           # full suite (also: python scripts/run_all_tests.py)
 python -m pytest tests/test_matcher.py::test_name -q   # single test
 python eval/run_eval.py --strict --real --ablations    # scorecard; writes reports/eval_report.md (CI runs this)
+python scripts/cache_admin.py stats|purge ...  # caches (audited purges); scripts/retention.py [--apply]; scripts/verify_audit.py
+make help                                     # Makefile shortcuts (test, test-builtin, eval, lint, models, docker targets - docker unverified)
 uvicorn app.api:app --reload --port 8000      # FastAPI backend
 streamlit run app/ui.py                       # reviewer UI
 python scripts/bugfix_agent.py scan|fix [<issue-id>|--manual "desc"]   # human-approved bug-fix agent
 ```
 
-**Gotcha:** the local `.env` may select a live provider (`LLM_PROVIDER=minimax`), and `tests/conftest.py` does not force mock mode. Run tests and eval with `LLM_PROVIDER=mock SEARCH_PROVIDER=offline` exported (environment variables override `.env`); otherwise they call the live API and hang for minutes. CI has no `.env`, so it runs in mock mode. `eval/run_eval.py` overwrites `reports/eval_report.md`.
+**Gotchas:** `tests/conftest.py` now forces mock/offline and VRA_CACHE=0, but `eval/run_eval.py` and `run_assessor.py` still read `.env` (which may select `LLM_PROVIDER=minimax`): export `LLM_PROVIDER=mock SEARCH_PROVIDER=offline` for the eval. Run the suite on both backends: default, and `EMBEDDER=builtin RERANKER=builtin` (the CI backend). `eval/run_eval.py` overwrites `reports/eval_report.md`. Embedder/reranker models live in `~/.cache/fastembed` and load cache-first with a download deadline (`assessor/rag_core.py::load_fastembed`); if the real backend is slow or missing the suite still runs on builtin. Never run `pkill -f` / `pgrep -f` with a pattern that appears in your own command line.
 
-CI (`.github/workflows/ci.yml`) runs `pytest -q` then the strict eval on Python 3.11. There is no linter configured.
+CI (`.github/workflows/ci.yml`) has five jobs: tests + strict eval (builtin backend, `requirements.txt` only), ruff (`ruff.toml`, correctness rules only), pip-audit on `requirements-prod.lock` + gitleaks, the same tests on the real fastembed backend, and a Docker build (never run: Docker is not installed here). Governance and operations docs: `docs/GOVERNANCE.md`, `docs/RUNBOOK.md`.
 
 ## Architecture
 
@@ -35,6 +37,10 @@ CI (`.github/workflows/ci.yml`) runs `pytest -q` then the strict eval on Python 
 - **`llm.py`** wraps any OpenAI-compatible provider plus the `mock` provider; model routing uses `LLM.small()` for high-volume tasks and the main model for planning/synthesis. Settings all come from `config.py` (env-driven).
 - **`app/api.py`** (FastAPI; `X-API-Token` ACL, async jobs via `POST /assess?async_job=true`, `/vendors/{v}/history`, `/metrics`) and **`app/ui.py`** (Streamlit) sit on top of `Pipeline`.
 - **`bugfix/`** + `scripts/bugfix_agent.py`: separate agentic bug-fixing tool (detect → read-only diagnose → human approve → branch `bugfix/<id>` → scoped fix → verify vs. baseline → human commit/discard). Runtime errors are logged by `assessor/errors.py` to `runs/issues/errors.jsonl`. It requires a clean git tree and an interactive terminal; it blocks reads of `.env`/`.git`/`runs/` and protects tests and gold sets.
+
+## Live research
+
+`vendor_research.py::live_iteration` streams: searches, page downloads and extraction run concurrently, and each page is read as soon as it arrives. At `VRA_MAX_SECONDS` the run is closed (`run.closed`): finished pages count, in-flight work is discarded, missing fields become UNKNOWN. `fetching.search` caps every provider call (`SEARCH_HARD_CAP_S`) and falls through Tavily/ddgs. Live runs are non-deterministic (the web changes); verdicts for a given set of facts are not. Settings: see `.env.example` (sections 6-9). Docker, compose and `ops/` are written but unverified until someone has run them.
 
 ## Conventions
 
