@@ -85,7 +85,7 @@ def test_restricted_answer_cached_for_security_is_invisible_to_employees(cache):
     emp = pipe.run_plain(new_state(q, user_groups=["public", "employees"]))
     assert not emp["cache_hit"]
     assert all(c.doc != "approved_vendor_list.md" for c in emp["policy_answer"].citations)
-    assert "T2" not in emp["answer"] or emp["policy_answer"].abstained
+    assert "AVL-" not in emp["answer"]          # nothing from the restricted list, cached or not
 
 
 def test_abstentions_and_refusals_are_not_cached(cache):
