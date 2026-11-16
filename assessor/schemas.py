@@ -111,6 +111,8 @@ class SourceMeta(BaseModel):
     publisher: str = ""
     published_date: Optional[date] = None
     last_updated: Optional[date] = None
+    retrieved_at: Optional[str] = Field(default=None, description="When we fetched the page (ISO timestamp); None for the offline corpus")
+    found_by: str = Field(default="", description="The search query that surfaced this page")
 
     @property
     def effective_date(self) -> Optional[date]:
@@ -152,6 +154,8 @@ class VendorFact(BaseModel):
     evidence_level: EvidenceLevel
     sources: list[str] = Field(default_factory=list, description="URLs that support the chosen value")
     conflicts: list[str] = Field(default_factory=list, description="Other values seen, with their sources")
+    history: list[str] = Field(default_factory=list, description="Older values that a newer source superseded")
+    unresolved_conflict: bool = Field(default=False, description="A comparable, equally recent source disagrees")
 
 
 class VendorProfile(BaseModel):
@@ -164,6 +168,8 @@ class VendorProfile(BaseModel):
     dropped: list[str] = Field(default_factory=list, description="Claims dropped as rumour / unreliable, with reason")
     pages_read: int = 0
     notes: list[str] = Field(default_factory=list)
+    iterations: int = 1
+    stop_reason: str = ""
 
     def get(self, field: str) -> Optional[VendorFact]:
         return self.facts.get(field)
@@ -193,6 +199,14 @@ class PlanReview(BaseModel):
     approved: bool = True
     issues: list[str] = Field(default_factory=list)
     fixes_applied: list[str] = Field(default_factory=list)
+
+
+class PlanDecision(BaseModel):
+    """The Plan Evaluator's output after each research iteration (Deep Search Module 3)."""
+
+    action: Literal["continue", "stop"]
+    reasons: list[str] = Field(default_factory=list)
+    open_sub_questions: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

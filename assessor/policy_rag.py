@@ -26,8 +26,11 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from .config import POLICY_DIR
-from .rag_core import POLICY_SYSTEM_PROMPT, CrossEncoderReranker, DenseEmbedder, expand_concepts, reciprocal_rank_fusion, _stem
+from . import injection
+from .config import LOCAL_PROVIDERS, POLICY_DIR
+from .rag_core import (
+    POLICY_SYSTEM_PROMPT, DenseEmbedder, expand_concepts, get_reranker, linearise_tables, reciprocal_rank_fusion, _stem,
+)
 from .schemas import PolicyAnswer, PolicyHit
 
 STOPWORDS = set("""a an and are as at be by for from has have how if in is it its of on or our that the this to was we what
@@ -35,12 +38,6 @@ when where which who will with you your must may can does do did into than then 
 according say says said""".split())
 
 _CLAUSE_RE = re.compile(r"^([A-Z]{1,5}(?:-[\dA-Z]+)+(?:\.\d+)*)\b\s*(.*)$")  # SEC-4.2, AVL-1, Q-SEC-4.2, IR-1.1
-_INJ_RE = re.compile(
-    r"ignore\s+(all\s+|any\s+)?(previous|prior|above|other)\s+(instructions|sources)|"
-    r"reminder to all assistants|automated reviewers reading this|"
-    r"skip the (policy|security) checks|report\s+pass\b",
-    re.I,
-)
 
 
 def tokenize(text: str) -> list[str]:
@@ -90,7 +87,7 @@ def chunk_markdown(doc: str, text: str, meta: dict) -> list[PolicyChunk]:
                 trust=meta.get("trust", "trusted"), access=list(meta.get("access", ["public"])),
                 effective_date=str(meta.get("effective_date", "")),
                 tokens=tokenize(full_text),
-                injection_flag=bool(_INJ_RE.search(full_text)),
+                injection_flag=injection.is_injection(full_text),
             ))
 
     for line in text.splitlines():
@@ -142,8 +139,13 @@ class BM25:
 
 
 class PolicyLibrary:
-    ABSTAIN_BELOW = 0.22  # Reranked / hybrid threshold; tuned with eval/run_eval.py
+    ABSTAIN_BELOW = 0.22  # Reranked / hybrid threshold for the built-in scorer; tuned with eval/run_eval.py
+    # With a real cross-encoder the score is sigmoid(logit / 4). On this library, answerable questions score
+    # 0.45+ for their best clause and unrelated ones about 0.07; 0.25 (logit -4.4) sits in the gap. Re-check
+    # with eval/run_eval.py if the reranker model changes.
+    MODEL_ABSTAIN_BELOW = 0.25
     BM25_ABSTAIN_BELOW = 2.0
+    PUBLIC_GROUPS = frozenset({"public", "employees"})   # chunks readable by these may be sent to a cloud model
 
     def __init__(self, policy_dir: Path = POLICY_DIR, *, use_hybrid: bool = True, use_rerank: bool = True):
         self.policy_dir = Path(policy_dir)
@@ -160,8 +162,14 @@ class PolicyLibrary:
             self.chunks.extend(chunk_markdown(name, p.read_text(encoding="utf-8"), m))
         self.bm25 = BM25([c.tokens for c in self.chunks])
         self.embedder = DenseEmbedder()
-        self.reranker = CrossEncoderReranker()
-        chunk_texts = [f"{c.title} > {c.heading}\n{c.text}" for c in self.chunks]
+        self.reranker = get_reranker()
+        # What the models read: tables written out as sentences (see rag_core.linearise_tables). The built-in
+        # fallback embedder keeps the raw text it was tuned on.
+        self.model_texts = [f"{c.heading}\n{linearise_tables(c.text)}" for c in self.chunks]
+        if self.embedder.backend == "builtin":
+            chunk_texts = [f"{c.title} > {c.heading}\n{c.text}" for c in self.chunks]
+        else:
+            chunk_texts = [f"{c.title} > {t}" for c, t in zip(self.chunks, self.model_texts)]
         self.vectors = self.embedder.encode(chunk_texts)
 
     # ------------------------------------------------------------------ filters
@@ -233,15 +241,22 @@ class PolicyLibrary:
         rrf_scores = reciprocal_rank_fusion([bm25_ranked, vec_ranked], k=60, weights=(1.0, 1.0))
         candidates = [i for i, _ in sorted(rrf_scores.items(), key=lambda x: -x[1])[: max(15, k * 3)]]
 
-        # 4. Cross-Encoder Reranking on the candidate pool
+        # 4. Cross-Encoder Reranking on the candidate pool (one batched model call)
+        by_model = self.use_rerank and self.reranker.uses_model
+        ce_scores = (self.reranker.score_batch(question, [(self.chunks[i].heading, self.chunks[i].text, self.chunks[i].clause_id)
+                                                          for i in candidates], [self.model_texts[i] for i in candidates])
+                     if self.use_rerank else [0.0] * len(candidates))
         hits: list[PolicyHit] = []
-        for i in candidates:
+        for i, ce in zip(candidates, ce_scores):
             c = self.chunks[i]
             rrf = rrf_scores.get(i, 0.0)
             bm = bm25_scores.get(i, 0.0)
-            if self.use_rerank:
-                ce = self.reranker.score_pair(question, c.heading, c.text, c.clause_id)
-                # Combine cross-encoder score with RRF & lexical signal
+            if by_model:
+                # A real cross-encoder read the question and the clause together: its judgement is the ranking.
+                # BM25 and vectors only chose the candidates (standard two-stage retrieval).
+                final_score = round(ce, 4)
+            elif self.use_rerank:
+                # Built-in scorer: combine it with RRF & lexical signal
                 final_score = round(0.65 * ce + 0.25 * min(1.0, bm / 8.0) + 0.10 * min(1.0, rrf * 30.0), 4)
             else:
                 final_score = round(0.5 * min(1.0, bm / 8.0) + 0.5 * min(1.0, rrf * 30.0), 4)
@@ -296,7 +311,10 @@ class PolicyLibrary:
     def answer(self, question: str, user_groups: Iterable[str] = ("public",), *, llm=None, k: int = 4,
                include_archived: bool = False) -> PolicyAnswer:
         hits = self.search(question, user_groups, k=k, include_archived=include_archived)
-        threshold = self.ABSTAIN_BELOW if (self.use_hybrid or self.use_rerank) else self.BM25_ABSTAIN_BELOW
+        if not (self.use_hybrid or self.use_rerank):
+            threshold = self.BM25_ABSTAIN_BELOW
+        else:
+            threshold = self.MODEL_ABSTAIN_BELOW if (self.use_rerank and self.reranker.uses_model) else self.ABSTAIN_BELOW
         if not hits or hits[0].score < threshold:
             return PolicyAnswer(
                 question=question, abstained=True, citations=hits[:2],
@@ -304,7 +322,15 @@ class PolicyLibrary:
                        "If it concerns the Approved Vendor List, ask Procurement.",
             )
 
-        if llm is not None and not llm.mock_mode:
+        # Data-egress rule: clauses restricted to Security / Procurement (e.g. the Approved Vendor List) are never
+        # sent to a cloud model. They are answered by a model on this machine, or extractively with no model at all.
+        restricted = [h for h in hits if not (set(h.access) & self.PUBLIC_GROUPS)]
+        may_generate = llm is not None and not llm.mock_mode and (not restricted or llm.provider in LOCAL_PROVIDERS)
+        if llm is not None and not llm.mock_mode and restricted and not may_generate:
+            if llm.tracer:
+                llm.tracer.event("egress_blocked", clauses=[h.clause_id or h.heading for h in restricted][:5],
+                                 provider=llm.provider, action="answered extractively")
+        if may_generate:
             sources_block = "\n\n".join(
                 f"<source id={i+1} clause={h.clause_id or h.heading!r} title={h.title!r} version={h.version!r}>\n{h.text}\n</source>"
                 for i, h in enumerate(hits)

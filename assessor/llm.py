@@ -294,6 +294,25 @@ class LLM:
             return schema.model_validate(data)
 
         json_schema = schema.model_json_schema()
+        # Content-addressed cache of VALIDATED outputs: the key is the model plus the full prompt, so an answer
+        # is only ever reused for exactly the same question about exactly the same text (see cache.py).
+        from .cache import LLM_TTL_S, get_cache, sha
+
+        cache = get_cache()
+        cache_key = sha(self.model, system, user, schema.__name__) if cache.enabled and (SETTINGS.llm_temperature or 0) <= 0.01 else ""
+        if cache_key:
+            hit = cache.get("llm", cache_key, run_id=self.tracer.run_id if self.tracer else "")
+            if hit:
+                try:
+                    out = schema.model_validate(hit["data"])
+                    self._trace("llm", llm_stage=stage, model=hit.get("model", self.model), provider=hit.get("provider", self.provider),
+                                role=self.role, cached=True)
+                    self.budget.charge(hit.get("in", 0), hit.get("out", 0), model=self.model, role=self.role, stage=stage,
+                                       provider=self.provider, cached=True)
+                    return out
+                except ValidationError:
+                    pass   # schema changed since it was stored: ask again
+        tok_before = (self.budget.input_tokens, self.budget.output_tokens)
         schema_hint = json.dumps(json_schema, indent=0)
         sys_full = f"{system}\n\nReturn ONLY a valid JSON object that matches this JSON Schema (no markdown fences, no commentary):\n{schema_hint}"
         prompt = user
@@ -302,7 +321,12 @@ class LLM:
             raw = self.chat(sys_full, prompt, stage=f"{stage}#{attempt}", json_mode=True, schema=json_schema,
                             schema_name=schema.__name__)
             try:
-                return schema.model_validate_json(_extract_json(raw))
+                out = schema.model_validate_json(_extract_json(raw))
+                if cache_key:
+                    cache.put("llm", cache_key, {"data": out.model_dump(mode="json"), "model": self.model, "provider": self.provider,
+                                                 "in": self.budget.input_tokens - tok_before[0],
+                                                 "out": self.budget.output_tokens - tok_before[1]}, ttl=LLM_TTL_S)
+                return out
             except (ValidationError, ValueError) as exc:
                 last_err = str(exc)
                 prompt = (f"{user}\n\nYour previous answer was not valid:\n{raw[:2000]}\n\n"

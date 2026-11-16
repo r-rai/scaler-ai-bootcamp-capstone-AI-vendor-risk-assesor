@@ -1,0 +1,73 @@
+# Who is what on the web. vendor_research.guess_source_type() reads this file; its hash is part of every
+# report's provenance stamp, so a change here is visible in the reports it affected.
+#
+# A host matches a type when it contains one of the listed fragments. The vendor's own domain is always
+# "official" and is not listed here. Anything unmatched is "unknown" (authority 0.2, and never sufficient
+# for a high-stakes field unless the page is itself a documented artefact).
+#
+# Review this list like policy: adding a host to `regulator` or `news` raises the weight of everything it says.
+
+regulator:        # certification bodies and registries: primary ground truth for certificates
+  - certisassurance
+  - iafcertsearch
+  - schellman
+  - bsigroup
+  - aicpa
+  - cloudsecurityalliance
+  - dnv.com
+  - tuv
+
+news:             # named outlets with editorial accountability
+  - technews
+  - securitydaily
+  - reuters
+  - bloomberg
+  - techcrunch
+  - bleepingcomputer
+  - therecord
+  - theregister
+  - wired.com
+  - arstechnica
+  - krebsonsecurity
+  - securityweek
+  - darkreading
+  - economictimes
+  - livemint
+
+news_syndicated:  # reprints and directories: a copy, not corroboration
+  - prnewswire
+  - businesswire
+  - newswire
+  - globenewswire
+  - saasdirectory
+  - crunchbase
+  - linkedin.com
+
+review_site:      # customer experience; often describes one plan, not the current terms
+  - g2.com
+  - capterra
+  - trustradius
+  - reviewhub
+  - gartner.com
+  - getapp
+  - softwareadvice
+
+forum:            # rumour by definition (SEC-9.4): claims are dropped, not scored low
+  - reddit
+  - forum
+  - community
+  - stackexchange
+  - stackoverflow
+  - news.ycombinator
+  - devforum
+  - quora
+  - x.com
+  - twitter.com
+
+blog:             # unverified commentary
+  - medium.com
+  - substack
+  - blog
+  - guru
+  - dev.to
+  - hashnode
