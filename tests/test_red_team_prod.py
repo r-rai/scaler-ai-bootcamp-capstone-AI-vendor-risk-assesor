@@ -137,3 +137,63 @@ def test_normalise_is_idempotent_and_keeps_meaning():
     t = "Data is stored in the EU (Frankfurt) — see §4.2."
     assert injection.normalise(injection.normalise(t)) == injection.normalise(t)
     assert "Frankfurt" in injection.normalise(t)
+
+
+# --- the model's JSON meets the rules (claims.py) ------------------------------------------------------
+
+def _claim(field, value, level="documented"):
+    return Claim(field=field, value=value, display="d", evidence_level=level)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("subprocessors", ["AWS", "OpenAI"]),                                   # bare names: no category, a model provider could hide
+    ("subprocessors", [{"name": "OpenAI", "category": "llm"}]),             # unknown category
+    ("subprocessors", [{"name": "AWS", "category": "hosting"}, "OpenAI"]),  # one bad entry spoils the list
+    ("security_certifications", ["SOC 2 Type II"]),                         # a mention, not a status
+    ("security_certifications", [{"name": "SOC 2 Type II"}]),               # no status: must not default to certified
+    ("data_regions", ["India", "US"]),                                      # available or planned? unknown
+    ("data_regions", {"available": "India"}),
+    ("security_incidents", [{"summary": "breach", "severity": "major"}]),   # undated major incident must not vanish silently
+    ("security_incidents", [{"date": "2026-13-45", "summary": "x", "severity": "major"}]),
+    ("data_retention", {"default_days": "a while"}),
+    ("sso_saml", "yes, on some plans"),
+    ("trains_on_customer_data", None),
+    ("legal_entity", "Acme Inc"),
+])
+def test_attack_25_malformed_claim_values_are_rejected_not_repaired(field, value):
+    from assessor.claims import normalise_claim
+
+    claim, why = normalise_claim(_claim(field, value))
+    assert claim is None and why
+
+
+def test_claim_normalisation_restructures_without_inventing():
+    from assessor.claims import normalise_claim
+
+    c, _ = normalise_claim(_claim("security_certifications", [{"name": "soc2 type 2", "status": "Certified", "date": "2026-01-10T00:00:00Z", "valid_until": "soon"}]))
+    assert c.value == [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-01-10", "valid_until": None, "issuer": None}]
+    c, _ = normalise_claim(_claim("data_retention", {"default_days": "30 days", "deletion_on_request_days": None}))
+    assert c.value == {"default_days": 30, "deletion_on_request_days": None}
+    c, _ = normalise_claim(_claim("security_incidents", [{"date": "2026-03-14", "summary": "s", "severity": "Critical", "postmortem_published": "yes"}]))
+    assert c.value[0]["severity"] == "major" and c.value[0]["postmortem_published"] is False     # "yes" is not True
+    c, _ = normalise_claim(_claim("security_incidents", []))
+    assert c is not None and c.value == []                                                       # "no incidents" is a valid claim
+    c, _ = normalise_claim(_claim("sso_saml", " Paid Plans "))
+    assert c.value == "paid_plans"
+
+
+def test_matcher_survives_an_unreadable_fact_and_reports_unknown():
+    """Defence in depth: even if a bad value reached the matcher, the verdict is UNKNOWN, never a crash or a guess."""
+    from assessor.matcher import Matcher
+    from assessor.policy_rag import PolicyLibrary
+    from assessor.schemas import AssessmentRequest, VendorFact, VendorProfile
+
+    prof = VendorProfile(vendor="V", as_of=__import__("datetime").date(2026, 11, 1))
+    prof.facts["subprocessors"] = VendorFact(field="subprocessors", value=["AWS", "OpenAI"], display="AWS, OpenAI", confidence=0.9,
+                                             evidence_level="documented", sources=["https://v.example/sub"])
+    prof.facts["security_incidents"] = VendorFact(field="security_incidents", value=[{"date": "not-a-date", "severity": "major"}], display="x",
+                                                  confidence=0.9, evidence_level="documented", sources=["https://v.example/inc"])
+    res = Matcher(PolicyLibrary()).evaluate(prof, AssessmentRequest(question="q", vendor="V", tier="T3", users=30))
+    by_field = {r.requirement_id: r for r in res}
+    bad = [r for r in res if "could not be interpreted" in r.reason]
+    assert len(bad) >= 2 and all(r.verdict == "UNKNOWN" for r in bad)

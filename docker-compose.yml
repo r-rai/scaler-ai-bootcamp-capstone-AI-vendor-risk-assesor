@@ -1,0 +1,242 @@
+# AI Vendor Risk Assessor — local production stack
+#
+#   docker compose up -d --build                      # api + ui + sandboxed fetcher
+#   docker compose --profile llm up -d                # + local small model on the GPU (llama.cpp)
+#   docker compose --profile obs up -d                # + Prometheus, Grafana, Loki, Jaeger
+#   docker compose --profile llm --profile obs up -d  # everything (same as: make up-all)
+#
+# UI http://localhost:8501 · API http://localhost:8000/docs · Grafana http://localhost:3000 · Jaeger http://localhost:16686
+#
+# Hardening applied to every app container: non-root user, read-only root filesystem, all Linux capabilities
+# dropped, no privilege escalation, memory / CPU / process limits, ports bound to 127.0.0.1 only.
+#
+# Networks
+#   edge      normal bridge: outbound internet for the API (MiniMax, Tavily, DuckDuckGo)
+#   backend   internal (no internet): api <-> llm, observability
+#   sandbox   internal: api <-> fetcher only
+#   fetchnet  bridge: the fetcher's own route to the internet, shared with nothing else
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs: ["/tmp:size=256m,mode=1777"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 512
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+x-app-image: &app-image
+  image: vendor-risk-assessor:local
+  build:
+    context: .
+    args:
+      GIT_SHA: ${GIT_SHA:-unknown}
+
+services:
+  api:
+    <<: [*app-image, *hardening]
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      VRA_ENV: ${VRA_ENV:-prod}
+      VRA_TOKENS_FILE: /data/runs/tokens.json
+      VRA_FETCHER_URL: http://fetcher:8600
+      LLAMACPP_BASE_URL: http://llm:8080/v1
+      INJECTION_MODEL: /models/injection/deberta-v3-base-prompt-injection-v2/onnx
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - runs:/data/runs
+      - models-cache:/data/models-cache
+      - ./models/injection:/models/injection:ro
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [edge, backend, sandbox]
+    depends_on:
+      fetcher: {condition: service_healthy}
+    mem_limit: 3g
+    cpus: 4
+
+  ui:
+    <<: [*app-image, *hardening]
+    command: ["streamlit", "run", "app/ui.py", "--server.port", "8501", "--server.address", "0.0.0.0", "--server.headless", "true"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      VRA_ENV: ${VRA_ENV:-prod}
+      VRA_TOKENS_FILE: /data/runs/tokens.json
+      VRA_FETCHER_URL: http://fetcher:8600
+      LLAMACPP_BASE_URL: http://llm:8080/v1
+      INJECTION_MODEL: /models/injection/deberta-v3-base-prompt-injection-v2/onnx
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - runs:/data/runs
+      - models-cache:/data/models-cache
+      - ./models/injection:/models/injection:ro
+    ports: ["127.0.0.1:8501:8501"]
+    networks: [edge, backend, sandbox]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      fetcher: {condition: service_healthy}
+    mem_limit: 3g
+    cpus: 4
+
+  # The sandbox: downloads and parses untrusted pages. No env_file (so no API keys), no volumes.
+  fetcher:
+    <<: [*app-image, *hardening]
+    command: ["uvicorn", "fetcher.app:app", "--host", "0.0.0.0", "--port", "8600", "--workers", "2"]
+    environment:
+      LLM_PROVIDER: mock
+      SEARCH_PROVIDER: offline
+      VRA_CACHE: "0"
+      VRA_RUNS_DIR: /tmp/runs
+    networks: [sandbox, fetchnet]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8600/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1
+    pids_limit: 128
+
+  # Local small model on the GPU. Needs the NVIDIA Container Toolkit (Docker Desktop: enable GPU support).
+  llm:
+    profiles: ["llm"]
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    command:
+      - --model
+      - /models/${LLAMA_MODEL_FILE:-Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf}
+      - --alias
+      - local-small
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --api-key
+      - ${LLAMACPP_API_KEY:-local}
+      - --n-gpu-layers
+      - "${LLAMA_GPU_LAYERS:-99}"
+      - --ctx-size
+      - "${LLAMA_CTX:-8192}"
+      - --parallel
+      - "${LLAMA_SLOTS:-2}"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --flash-attn
+      - "on"
+      - --reasoning
+      - "off"
+      - --metrics
+      - --no-webui
+    volumes:
+      - ./models/llm:/models:ro
+    networks: [backend]            # internal only: the model server has no route to the internet
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    mem_limit: 6g
+
+  # ------------------------------ observability (profile: obs) ------------------------------
+  prometheus:
+    profiles: ["obs"]
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.0.1}
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./ops/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [backend]
+    restart: unless-stopped
+    mem_limit: 512m
+
+  grafana:
+    profiles: ["obs"]
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.4.0}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env before starting the obs profile}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [backend]
+    depends_on: [prometheus, loki, jaeger]
+    restart: unless-stopped
+    mem_limit: 512m
+
+  loki:
+    profiles: ["obs"]
+    image: ${LOKI_IMAGE:-grafana/loki:3.3.2}
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./ops/loki:/etc/loki:ro
+      - loki-data:/loki
+    networks: [backend]
+    restart: unless-stopped
+    mem_limit: 512m
+
+  # Ships the app's JSON log file (runs/logs/app.jsonl) to Loki. No Docker socket is mounted.
+  promtail:
+    profiles: ["obs"]
+    image: ${PROMTAIL_IMAGE:-grafana/promtail:3.3.2}
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./ops/promtail:/etc/promtail:ro
+      - runs:/data/runs:ro
+      - promtail-data:/positions
+    networks: [backend]
+    depends_on: [loki]
+    restart: unless-stopped
+    mem_limit: 128m
+
+  jaeger:
+    profiles: ["obs"]
+    image: ${JAEGER_IMAGE:-jaegertracing/all-in-one:1.64.0}
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "5000"
+    ports: ["127.0.0.1:16686:16686"]
+    networks: [backend]
+    restart: unless-stopped
+    mem_limit: 512m
+
+networks:
+  edge: {}
+  fetchnet: {}
+  backend:
+    internal: true
+  sandbox:
+    internal: true
+
+volumes:
+  runs: {}
+  models-cache: {}
+  prometheus-data: {}
+  grafana-data: {}
+  loki-data: {}
+  promtail-data: {}

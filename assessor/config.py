@@ -67,6 +67,11 @@ class Settings:
     llm_extract_provider: str = field(default_factory=lambda: _env("LLM_EXTRACT_PROVIDER", "").lower())
     llm_fallback: bool = field(default_factory=lambda: _env("LLM_FALLBACK", "1") == "1")
     llm_timeout_s: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT_S", 60.0))
+    # Reasoning effort for providers with adaptive thinking (verified on MiniMax). The high-volume roles
+    # (small, extract) classify and copy facts; "low" cut their latency and output tokens by more than half
+    # with the same answers. Blank = provider default.
+    llm_reasoning_effort: str = field(default_factory=lambda: _env("LLM_REASONING_EFFORT", "").lower())
+    llm_small_reasoning_effort: str = field(default_factory=lambda: _env("LLM_SMALL_REASONING_EFFORT", "low").lower())
 
     # --- Search --------------------------------------------------------------
     search_provider: str = field(default_factory=lambda: _env("SEARCH_PROVIDER", "offline").lower())
@@ -78,6 +83,9 @@ class Settings:
     embed_model: str = field(default_factory=lambda: _env("EMBED_MODEL", "BAAI/bge-small-en-v1.5"))
     reranker: str = field(default_factory=lambda: _env("RERANKER", "auto").lower())
     rerank_model: str = field(default_factory=lambda: _env("RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2"))
+    # fastembed otherwise caches in the system temp dir, which a reboot or `wsl --shutdown` wipes.
+    fastembed_cache: str = field(default_factory=lambda: _env(
+        "FASTEMBED_CACHE_PATH", str(Path.home() / ".cache" / "fastembed")))
 
     # --- Agent behaviour -----------------------------------------------------
     as_of: date = field(default_factory=lambda: date.fromisoformat(_env("VRA_AS_OF", "2026-11-01")))
@@ -86,6 +94,8 @@ class Settings:
     max_tokens: int = field(default_factory=lambda: _env_int("VRA_MAX_TOKENS", 400_000))
     max_tool_calls: int = field(default_factory=lambda: _env_int("VRA_MAX_TOOL_CALLS", 120))    # searches + fetches
     max_iterations: int = field(default_factory=lambda: _env_int("VRA_MAX_ITERATIONS", 2))      # research passes
+    # template = the fixed 9-field checklist (instant, free, auditable); llm = the main model writes the plan.
+    planner: str = field(default_factory=lambda: _env("VRA_PLANNER", "template").lower())
     max_parallel: int = field(default_factory=lambda: _env_int("VRA_MAX_PARALLEL", 4))
     verbose: bool = field(default_factory=lambda: _env("VRA_VERBOSE", "1") == "1")
 
@@ -115,9 +125,9 @@ class Settings:
 
     # --- Web fetching (assessor/fetching.py) ----------------------------------
     fetcher_url: str = field(default_factory=lambda: _env("VRA_FETCHER_URL", ""))      # sandboxed fetch service, if any
-    fetch_max_bytes: int = field(default_factory=lambda: _env_int("VRA_FETCH_MAX_BYTES", 2_000_000))
-    fetch_timeout_s: float = field(default_factory=lambda: _env_float("VRA_FETCH_TIMEOUT_S", 15.0))
-    pages_per_question: int = field(default_factory=lambda: _env_int("VRA_PAGES_PER_QUESTION", 3))
+    fetch_max_bytes: int = field(default_factory=lambda: _env_int("VRA_FETCH_MAX_BYTES", 5_000_000))
+    fetch_timeout_s: float = field(default_factory=lambda: _env_float("VRA_FETCH_TIMEOUT_S", 12.0))
+    pages_per_question: int = field(default_factory=lambda: _env_int("VRA_PAGES_PER_QUESTION", 2))
 
     # --- Bug-fix agent (defaults to the main LLM settings) --------------------
     bugfix_provider: str = field(default_factory=lambda: _env("BUGFIX_LLM_PROVIDER", "").lower())
@@ -172,7 +182,8 @@ class Settings:
         if not api_key:
             raise ValueError(f"LLM_PROVIDER={p} needs an API key in .env (see .env.example).")
         # LLM_MODEL / LLM_SMALL_MODEL name models of the MAIN provider only; any other provider uses its own default.
-        is_main = p == self.llm_provider
+        # A llama.cpp server serves one model under its own alias, whatever LLM_MODEL says.
+        is_main = p == self.llm_provider and p != "llamacpp"
         if role in ("small", "extract"):
             chosen_model = ((self.llm_small_model or self.llm_model) if is_main else "") or default_small
         else:
@@ -187,7 +198,9 @@ class Settings:
         if role == "small":
             return self.llm_small_provider or self.llm_provider
         if role == "extract":
-            return self.llm_extract_provider or self.llm_small_provider or self.llm_provider
+            # Extraction reads whole pages (long prompts) and its accuracy drives the report. It defaults to the
+            # MAIN provider's small model, not the local one; move it with LLM_EXTRACT_PROVIDER after measuring.
+            return self.llm_extract_provider or self.llm_provider
         return self.llm_provider
 
 

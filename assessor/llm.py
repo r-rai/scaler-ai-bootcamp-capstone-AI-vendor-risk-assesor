@@ -37,6 +37,7 @@ class LLMError(RuntimeError):
     pass
 
 
+REASONING_EFFORT_PROVIDERS = frozenset({"minimax", "openai", "openrouter"})   # accept reasoning_effort
 BREAKER_THRESHOLD = 3      # consecutive failures before a provider is skipped
 BREAKER_COOLDOWN_S = 60.0
 _BREAKERS: dict[str, dict[str, float]] = {}
@@ -178,6 +179,9 @@ class LLM:
             if cfg["provider"] == "minimax" and temp <= 0.0:
                 temp = 0.01
             kwargs["temperature"] = temp
+        effort = SETTINGS.llm_small_reasoning_effort if self.role in ("small", "extract") else SETTINGS.llm_reasoning_effort
+        if effort and cfg["provider"] in REASONING_EFFORT_PROVIDERS:
+            kwargs["reasoning_effort"] = effort
         if schema is not None and cfg["provider"] == "llamacpp":
             # llama.cpp compiles the JSON Schema to a grammar: the small model cannot emit invalid JSON.
             kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name, "schema": schema}}
@@ -186,10 +190,11 @@ class LLM:
         client = _client(cfg)
         try:
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 — some providers reject response_format; retry once without it
-            if "response_format" not in kwargs:
+        except Exception:  # noqa: BLE001 — some providers reject an optional parameter; retry once without them
+            if "response_format" not in kwargs and "reasoning_effort" not in kwargs:
                 raise
-            kwargs.pop("response_format")
+            kwargs.pop("response_format", None)
+            kwargs.pop("reasoning_effort", None)
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
 
     def _complete(self, messages: list[dict], *, stage: str, **kw):

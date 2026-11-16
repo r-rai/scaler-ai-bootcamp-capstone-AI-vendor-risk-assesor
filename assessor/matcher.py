@@ -23,6 +23,7 @@ from typing import Callable, Optional
 import yaml
 
 from .config import REQUIREMENTS_FILE
+from .errors import record_error
 from .policy_rag import PolicyLibrary
 from .schemas import (AssessmentRequest, Overall, Requirement, RequirementResult, Verdict, VendorFact, VendorProfile)
 
@@ -222,7 +223,14 @@ class Matcher:
                 verdict, reason = "NOT_APPLICABLE", f"Applies to tiers {', '.join(req.applies_when.tiers)}" + (
                     f" or {req.applies_when.or_min_users}+ users" if req.applies_when.or_min_users else "") + f"; this request is {request.tier}, {request.users} users."
             else:
-                verdict, reason = RULES[req.rule](req, fact, ctx)
+                try:
+                    verdict, reason = RULES[req.rule](req, fact, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    # A rule that cannot read its evidence must not take the whole assessment down, and must not
+                    # guess. The requirement is reported as not established and the defect is logged for a fix.
+                    record_error("matcher:rule", exc, {"requirement": req.id, "rule": req.rule, "vendor": request.vendor})
+                    verdict, reason = "UNKNOWN", ("The evidence found for this requirement could not be interpreted, "
+                                                  "so it is treated as not established. Ask the vendor.")
             q_id = None
             if verdict in ("UNKNOWN", "NEEDS_REVIEW"):
                 q_id = QUESTION_FOR_CLAUSE.get(req.clause)

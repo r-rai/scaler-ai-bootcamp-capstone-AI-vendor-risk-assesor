@@ -41,7 +41,8 @@ ALLOWED_PORTS = {None, 80, 443}
 ALLOWED_TYPES = ("text/html", "application/xhtml+xml", "text/plain", "application/pdf")
 MAX_REDIRECTS = 5
 MAX_TEXT_CHARS = 20_000
-HOST_MIN_INTERVAL_S = 0.5
+HOST_MIN_INTERVAL_S = 0.25
+SEARCH_TIMEOUT_S = 10
 
 _host_last: dict[str, float] = {}
 _host_lock = threading.Lock()
@@ -100,11 +101,13 @@ def check_url(url: str, *, resolve: bool = True) -> str:
 
 
 def _pace(host: str) -> None:
+    """Be polite: space out requests to the same host. Each caller reserves the next free slot."""
     with _host_lock:
-        wait = _host_last.get(host, 0.0) + HOST_MIN_INTERVAL_S - time.monotonic()
-        _host_last[host] = max(time.monotonic(), _host_last.get(host, 0.0) + HOST_MIN_INTERVAL_S)
-    if wait > 0:
-        time.sleep(min(wait, 3.0))
+        now = time.monotonic()
+        slot = max(now, _host_last.get(host, 0.0) + HOST_MIN_INTERVAL_S)
+        _host_last[host] = slot
+    if slot > now:
+        time.sleep(min(slot - now, 3.0))
 
 
 def _download(url: str) -> tuple[bytes, str, str]:
@@ -112,7 +115,9 @@ def _download(url: str) -> tuple[bytes, str, str]:
     import httpx
 
     current = url
-    with httpx.Client(follow_redirects=False, timeout=SETTINGS.fetch_timeout_s, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf;q=0.9,text/plain;q=0.8"}) as client:
+    started = time.monotonic()
+    timeout = httpx.Timeout(SETTINGS.fetch_timeout_s, connect=5.0)
+    with httpx.Client(follow_redirects=False, timeout=timeout, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf;q=0.9,text/plain;q=0.8"}) as client:
         for _ in range(MAX_REDIRECTS + 1):
             check_url(current)
             _pace(host_of(current))
@@ -125,11 +130,16 @@ def _download(url: str) -> tuple[bytes, str, str]:
                 ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
                 if ctype and not ctype.startswith(ALLOWED_TYPES):
                     raise FetchError(f"content type {ctype!r} is not read")
+                declared = r.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > SETTINGS.fetch_max_bytes:
+                    raise FetchError(f"response larger than {SETTINGS.fetch_max_bytes} bytes")      # fail before downloading
                 buf = bytearray()
                 for chunk in r.iter_bytes():
                     buf.extend(chunk)
                     if len(buf) > SETTINGS.fetch_max_bytes:
                         raise FetchError(f"response larger than {SETTINGS.fetch_max_bytes} bytes")
+                    if time.monotonic() - started > SETTINGS.fetch_timeout_s * 2:
+                        raise FetchError("download took too long")                                   # slow-drip responses
                 return bytes(buf), ctype, current
     raise FetchError("too many redirects")
 
@@ -290,8 +300,12 @@ def _search_ddgs(query: str, limit: int) -> list[dict]:
         from ddgs import DDGS
     except ImportError as exc:
         raise RuntimeError("pip install ddgs") from exc
+    try:
+        client = DDGS(timeout=SEARCH_TIMEOUT_S)
+    except TypeError:          # older ddgs without the timeout argument
+        client = DDGS()
     return [{"url": r["href"], "title": r.get("title", ""), "snippet": (r.get("body") or "")[:400]}
-            for r in DDGS().text(query, max_results=limit) if r.get("href")]
+            for r in client.text(query, max_results=limit) if r.get("href")]
 
 
 def _search_tavily(query: str, limit: int) -> list[dict]:
@@ -332,6 +346,8 @@ def search(query: str, limit: int, *, refresh: bool = False, budget: Any = None,
     errors: list[str] = []
     for provider in search_order():
         for attempt in range(2):
+            if attempt and errors and "Timeout" in errors[-1]:
+                break                      # a timeout is not worth a second wait: move to the next provider
             try:
                 if budget is not None:
                     budget.charge_tool("search", provider)

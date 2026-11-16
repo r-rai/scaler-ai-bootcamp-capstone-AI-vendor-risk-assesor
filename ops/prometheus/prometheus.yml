@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: vendor-risk-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  # llama.cpp exposes tokens/second, slot usage and queue length when started with --metrics.
+  - job_name: local-llm
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: local          # must match LLAMACPP_API_KEY
+    static_configs:
+      - targets: ["llm:8080"]

@@ -78,7 +78,7 @@ class DenseEmbedder:
             try:
                 from fastembed import TextEmbedding  # type: ignore[import-not-found]
 
-                self._model = TextEmbedding(model_name=SETTINGS.embed_model)
+                self._model = TextEmbedding(model_name=SETTINGS.embed_model, cache_dir=SETTINGS.fastembed_cache)
                 self.backend = f"fastembed:{SETTINGS.embed_model}"
             except Exception:  # noqa: BLE001
                 pass
@@ -185,7 +185,7 @@ class CrossEncoderReranker:
             try:
                 from fastembed.rerank.cross_encoder import TextCrossEncoder  # type: ignore[import-not-found]
 
-                self._model = TextCrossEncoder(model_name=SETTINGS.rerank_model)
+                self._model = TextCrossEncoder(model_name=SETTINGS.rerank_model, cache_dir=SETTINGS.fastembed_cache)
                 self.backend = f"fastembed:{SETTINGS.rerank_model}"
             except Exception:  # noqa: BLE001
                 pass

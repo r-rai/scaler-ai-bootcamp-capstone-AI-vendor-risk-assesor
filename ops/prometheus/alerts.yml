@@ -1,0 +1,69 @@
+# Alert rules. View them at http://localhost:9090/alerts and on the Grafana "Overview" dashboard.
+# No Alertmanager is bundled: on one laptop the dashboard is the pager. Add one to route these elsewhere.
+groups:
+  - name: vendor-risk-assessor
+    rules:
+      - alert: ApiDown
+        expr: up{job="vendor-risk-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "The API is not answering scrapes."}
+
+      - alert: HighErrorRate
+        expr: sum(rate(vra_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(vra_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "More than 5% of API requests are failing."}
+
+      - alert: AssessmentLatencyOverTarget
+        expr: histogram_quantile(0.95, sum by (le) (rate(vra_run_seconds_bucket{route="assessment"}[30m]))) > 90
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "p95 assessment latency is above the 90 s target."}
+
+      - alert: BudgetStops
+        expr: increase(vra_budget_stops_total[30m]) > 2
+        labels: {severity: warning}
+        annotations: {summary: "Runs are being cut short by a budget limit: reports will contain more UNKNOWNs."}
+
+      - alert: DailySpendNearCap
+        expr: vra_spend_cap_usd{period="day"} > 0 and vra_spend_usd_today / vra_spend_cap_usd{period="day"} > 0.8
+        labels: {severity: warning}
+        annotations: {summary: "Today's LLM spend is above 80% of the daily cap."}
+
+      - alert: MonthlySpendNearCap
+        expr: vra_spend_cap_usd{period="month"} > 0 and vra_spend_usd_month / vra_spend_cap_usd{period="month"} > 0.8
+        labels: {severity: warning}
+        annotations: {summary: "This month's LLM spend is above 80% of the monthly cap."}
+
+      - alert: InjectionSpike
+        expr: increase(vra_guardrail_events_total{layer="quarantined"}[1h]) > 10
+        labels: {severity: warning}
+        annotations: {summary: "Unusually many pages were quarantined for prompt injection in the last hour."}
+
+      - alert: AuthFailures
+        expr: increase(vra_guardrail_events_total{layer="auth"}[15m]) > 20
+        labels: {severity: warning}
+        annotations: {summary: "Many rejected API tokens: possible credential guessing."}
+
+      - alert: LocalModelDown
+        expr: vra_local_llm_up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "The local model is down; small-model calls are falling back to the cloud provider (costs money)."}
+
+      - alert: AuditChainBroken
+        expr: vra_audit_chain_ok == 0
+        labels: {severity: critical}
+        annotations: {summary: "The audit log hash chain no longer verifies. Run scripts/verify_audit.py and investigate."}
+
+      - alert: EvalRegression
+        expr: vra_eval_metric{metric="verdict_accuracy"} < 0.95 or vra_eval_metric{metric="guess_rate"} > 0 or vra_eval_metric{metric="safety"} < 1
+        labels: {severity: critical}
+        annotations: {summary: "The latest evaluation run is below a release threshold."}
+
+      - alert: JobBacklog
+        expr: vra_jobs{status="queued"} > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "More than 10 assessments have been queued for 10 minutes."}

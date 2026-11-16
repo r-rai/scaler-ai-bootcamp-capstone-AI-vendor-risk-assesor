@@ -178,6 +178,6 @@ def classifier_score(text: str) -> Optional[float]:
 
 def classifier_threshold() -> float:
     try:
-        return float(os.environ.get("INJECTION_THRESHOLD", "0.9"))
+        return float(os.environ.get("INJECTION_THRESHOLD", "0.99"))
     except ValueError:
-        return 0.9
+        return 0.99
