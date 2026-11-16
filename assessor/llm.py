@@ -153,6 +153,17 @@ class LLM:
         return cls(budget=budget, tracer=tracer, role="small")
 
     @classmethod
+    def local_only(cls, budget: Budget | None = None, tracer: Tracer | None = None) -> "LLM":
+        """For text that must not leave this machine (restricted policy clauses): small role, local endpoints only,
+        and no cloud fallback target. With no local model configured it is a mock-mode LLM, so callers use their
+        deterministic rule fallbacks instead."""
+        llm = cls(budget=budget, tracer=tracer, role="small")
+        llm.targets = [t for t in llm.targets if t.get("local")]
+        if not llm.targets:
+            llm.provider, llm.mock_mode, llm.model, llm.local = "mock", True, "mock-llm", False
+        return llm
+
+    @classmethod
     def extractor(cls, budget: Budget | None = None, tracer: Tracer | None = None) -> "LLM":
         """The model that reads web pages and returns typed claims (LLM_EXTRACT_PROVIDER)."""
         return cls(budget=budget, tracer=tracer, role="extract")

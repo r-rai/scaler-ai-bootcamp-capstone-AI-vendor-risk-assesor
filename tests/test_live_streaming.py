@@ -10,15 +10,16 @@ import pytest
 
 from assessor import fetching, rag_core
 from assessor.config import SETTINGS
-from assessor.schemas import Claim
+from assessor.schemas import Claim, VendorProfile
 from assessor.tracing import Budget, Tracer
-from assessor.vendor_research import VendorResearcher
+from assessor.vendor_research import VendorResearcher, _Run
 
 DOM = "streamco.example"
-SECURITY, PRICING = f"https://{DOM}/security", f"https://{DOM}/pricing"
+SECURITY, PRICING, BLANK = f"https://{DOM}/security", f"https://{DOM}/pricing", f"https://{DOM}/blank"
 TEXT = {
     SECURITY: "StreamCo holds ISO 27001 certification for its platform and publishes its audit scope. " * 3,
     PRICING: "Single sign-on with SAML is included on the Business plan and above for all customers. " * 3,
+    BLANK: "",                                           # a page with no readable text: triage records a drop for it
 }
 CLAIMS = {
     SECURITY: dict(field="security_certifications", evidence_level="documented", display="ISO 27001",
@@ -40,7 +41,7 @@ class Web:
             time.sleep(self.slow_search_s)             # a slow engine
             self.log.append(("search_done", query))
             return []
-        urls = [SECURITY] if "SOC 2" in query else [PRICING] if "SSO" in query else []
+        urls = [SECURITY, BLANK] if "SOC 2" in query else [PRICING] if "SSO" in query else []
         return [{"url": u, "title": u, "snippet": "StreamCo", "rank": i, "query": query, "provider": "stub",
                  "retrieved_at": "2026-11-01T00:00:00+00:00"} for i, u in enumerate(urls, 1)]
 
@@ -103,16 +104,24 @@ def test_deadline_keeps_what_finished_and_drops_what_did_not(monkeypatch, tmp_pa
     assert [e for e in tracer.events if e["stage"] == "deadline"]
 
 
-def test_a_late_result_cannot_change_the_profile_after_the_deadline(monkeypatch, tmp_path):
-    web = Web(slow_fetch={PRICING: 6.5})
+def test_a_page_that_arrives_after_the_deadline_cannot_touch_the_run(monkeypatch, tmp_path):
+    """`run.closed` exists so that work still in flight when the deadline passes cannot mutate the run (pages seen, drops,
+    rejected/quarantined lists) while the report is being built. A late page with no text is the observable case:
+    triage would record a drop for it."""
+    web = Web(slow_fetch={BLANK: 6.0})
     r, tracer = build(monkeypatch, tmp_path, web, max_seconds=4.0)
     try:
-        prof = r.research("StreamCo", DOM, refresh=True)
-        facts_at_return = sorted(prof.facts)
-        time.sleep(3.0)                                                # the hung worker now finishes
+        profile = VendorProfile(vendor="StreamCo", official_domain=DOM, as_of=r.as_of)
+        run = _Run(refresh=True)
+        r.live_iteration(r.make_plan("StreamCo", DOM).sub_questions, "StreamCo", DOM, 1, profile, run)
+        before = (sorted(run.pages), list(run.page_drops), list(profile.rejected), list(profile.quarantined))
+        assert run.closed
+        time.sleep(3.5)                                                # the hung download now completes inside its thread
     finally:
         tracer.close()
-    assert sorted(prof.facts) == facts_at_return
+    after = (sorted(run.pages), list(run.page_drops), list(profile.rejected), list(profile.quarantined))
+    assert after == before, "a late page changed the run after the deadline"
+    assert BLANK not in run.pages
 
 
 # ---- a hung search call -------------------------------------------------------------------------------------

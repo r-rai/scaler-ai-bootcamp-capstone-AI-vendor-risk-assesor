@@ -141,17 +141,27 @@ extra layer at a 0.99 threshold, never the only one. Verdicts never come from a 
 
 **Model files.** The embedder and reranker are read from `~/.cache/fastembed` (override `FASTEMBED_CACHE_PATH`), not
 `/tmp`. A model that is not cached is downloaded with a deadline (`VRA_MODEL_LOAD_TIMEOUT_S`), and the builtin backend is
-used if that stalls, so a bad network cannot hang startup or `/ready`. If large downloads stall at 0 bytes, set
+used if that stalls, so a bad network cannot hang startup or `/ready` (the fastembed backend; the optional
+sentence-transformers fallback, not installed here, has no such deadline). If large downloads stall at 0 bytes, set
 `HF_HUB_DISABLE_XET=1` (what `setup_models.sh` does by default).
 
-**Measured live run** (Zoho Desk Zia, T3, 35 users; MiniMax main and extract, local Qwen for small roles, ddgs search,
-caches off, builtin embedder and reranker, 2026-11-17, residential network): two clean runs took 78 s and 73 s wall-clock
-and read 8 and 9 pages for 5 and 6 facts. Both stopped on the time limit rather than finishing every sub-question. A
-run that shared the network with a model download took 100 s and 3 pages, which is why the numbers above are the clean
-ones. The overall outcome differed between the two runs (BLOCKED, then CONDITIONAL) because the live web returned
-different pages; for the same facts the matcher always gives the same verdicts. DuckDuckGo from this network times out
-on roughly half of the queries; Tavily (`SEARCH_PROVIDER=tavily`, free credits) is the better primary where a key is
-available. No live accuracy figure against `data/gold_set_real.json` has been measured yet.
+**Measured live run** (Zoho Desk Zia, T3, 35 users; MiniMax main and extract, local Qwen for the small roles, ddgs search,
+caches off, 2026-11-17, nothing else using the network). The 90 s limit applies to the run itself; the CLI adds a cold start
+(about 9 s with caches off because the policy corpus is re-embedded, about 1 s with the default caches).
+
+| Code at | Backends | Wall | In-run | Pages extracted / seen | Fields (of 9) | Searches failed |
+|---|---|---|---|---|---|---|
+| `1161a20` | builtin | 78 s | 76 s | 6 / 8 | 5 | 5 of 9 |
+| `1161a20` | builtin | 73 s | 73 s | 8 / 9 | 6 | 4 of 9 |
+| `a2a4682` | fastembed | 68 s | 56 s | 3 / 4 | 2 | 16 of 17 |
+| `a2a4682` | fastembed | 97 s | 87 s | 5 / 6 | 8 | 13 of 16 |
+
+So the "under 90 s with real facts" target is **not reliably met**: three of four runs finished under 90 s wall-clock, but the
+fastest one found only 2 of 9 fields because almost every search timed out, and the one with 8 of 9 fields took 97 s wall-clock.
+Whenever search worked, the run stopped on the time limit with pages still unread. The overall outcome also varied (BLOCKED or
+CONDITIONAL) because the web returned different pages; for the same facts the matcher always gives the same verdicts.
+DuckDuckGo from this network fails most queries; Tavily (`SEARCH_PROVIDER=tavily`) would likely help but no key is configured, so
+that is untested. No live accuracy figure against `data/gold_set_real.json` has been measured.
 
 **Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
 (Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**: Docker is not

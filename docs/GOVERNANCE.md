@@ -20,7 +20,7 @@ still weak. Written from the code as of branch `prod-hardening`. A control liste
 | The local injection classifier is never the only layer | `injection.py` (threshold 0.99, outage falls back to patterns) | `test_red_team_prod::test_attack_23_classifier_outage_does_not_disable_the_guardrail` |
 | Access control is applied before ranking | `policy_rag.py` (ACL, status, trust filters) | `test_policy_rag.py`, `test_cache::test_restricted_answer_cached_for_security_is_invisible_to_employees` |
 | Groups come from the token, not the request body (prod) | `auth.py`, `app/api.py` | `test_governance::test_prod_mode_requires_a_token_and_ignores_body_groups`, `test_api::test_groups_come_from_the_token_not_the_body`, `test_prod_mode_closes_every_door` |
-| Restricted policy text is never sent to a cloud model | `policy_rag.py` data-egress rule (local model or extractive answer only) | `test_egress.py` (cloud provider gets no restricted text; local model may; ordinary clauses still can) |
+| Restricted policy text is never sent to a cloud model | `policy_rag.py` data-egress rule for answer generation (local model or extractive answer only); `graders.py` + `LLM.local_only()` for the relevance and hallucination graders (local model or rule graders, no cloud fallback target) | `test_egress.py` (answer generation), `test_egress_pipeline.py` (whole policy path with the network faked: local server up or down, small role local or unset; also proves ordinary clauses still reach the cloud) |
 | Assessments never come from the semantic cache; abstentions and refusals are not cached | `cache.py`, `graph.py` | `test_cache::test_assessments_never_use_the_semantic_cache`, `test_abstentions_and_refusals_are_not_cached` |
 | Fetching is SSRF-safe (scheme, private/loopback/link-local ranges, redirects, size, content type) | `fetching.py` (and `fetcher/` when `VRA_FETCHER_URL` is set) | `test_fetching::test_unsafe_urls_are_refused`, `test_public_name_resolving_to_private_address_is_refused` |
 | Research about companies, not people | `guardrails.py::scrub_person_data` | `test_red_team_prod::test_attack_21_person_data_is_removed_from_claims` |
@@ -37,7 +37,7 @@ still weak. Written from the code as of branch `prod-hardening`. A control liste
 |---|---|---|---|---|
 | main (planning when `VRA_PLANNER=llm`, answer synthesis) | MiniMax-M3 | cloud | redacted question, non-restricted policy chunks | No |
 | extract (reading vendor pages) | MiniMax-M3.1-Flash | cloud | text of **public** web pages that passed the identity and injection gates | No: it proposes claims, `claims.py` validates their shape, `matcher.py` judges them |
-| small (routing, graders, identity gate, injection LLM layer) | Qwen3-4B-Instruct-2507 Q4_K_M via llama.cpp | local GPU (about 3.1 GB VRAM); falls back to the cloud small model, then to rules, if the server is down | redacted question, page excerpts, restricted policy text (it is local) | No |
+| small (routing, graders, identity gate, injection LLM layer) | Qwen3-4B-Instruct-2507 Q4_K_M via llama.cpp | local GPU (about 3.1 GB VRAM); falls back to the cloud small model, then to rules, if the server is down. **Exception:** graders working on restricted policy text use `LLM.local_only()`: local model, or rules if it is down or not configured; never the cloud | redacted question, page excerpts, restricted policy text (only on the local model) | No |
 | embedder | BAAI/bge-small-en-v1.5 (fastembed, ONNX) | local CPU | policy chunks, questions | No |
 | reranker | Xenova/ms-marco-MiniLM-L-6-v2 cross-encoder (fastembed, ONNX) | local CPU | question + chunk or search snippet | No |
 | injection classifier | protectai/deberta-v3-base-prompt-injection-v2 (ONNX) | local CPU | page text | No: one layer of several, threshold 0.99 |
@@ -50,7 +50,7 @@ Local-model selection (bake-off in `scripts/bakeoff_local_llm.py`): Qwen3-4B sco
 | Data | Leaves the machine? | Where to |
 |---|---|---|
 | Employee question | Only after PII/secret redaction (`guardrails.py`), and routing runs on the local model | MiniMax for main-role calls |
-| Restricted policy clauses (Approved Vendor List, security and procurement material) | **No** (local model or extractive answer only) | n/a |
+| Restricted policy clauses (Approved Vendor List, security and procurement material) | **No**, on the policy-answer path (answer generation and both graders). The other LLM calls receive only the question, or public web pages. This was **not** true of the graders until it was fixed on 2026-11-17 (see the git log): they used the cloud small model with the full text of every cited clause. | n/a |
 | Other policy clauses | Yes, when the main model writes an answer | MiniMax |
 | Vendor name and search queries | Yes | Tavily and/or DuckDuckGo |
 | Public vendor page text | Yes, for extraction | MiniMax |

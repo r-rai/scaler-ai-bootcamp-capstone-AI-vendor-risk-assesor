@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
-from .llm import LLM
+from .llm import LLM, LLMError
 from .policy_rag import PolicyLibrary, tokenize
 from .rag_core import expand_concepts
 from .schemas import BaseModel, PolicyAnswer
@@ -41,7 +41,26 @@ An answer that invents clauses, numbers, roles, or promises not present in the s
 Return JSON: {"verdict": true|false, "reason": "short explanation"}."""
 
 
-def grade_relevance(question: str, context: str, llm: Optional[LLM] = None) -> GradeResult:
+def _grader_llm(llm: Optional[LLM], local_only: bool) -> LLM:
+    if llm is None or llm.mock_mode:
+        return llm or LLM()
+    if local_only:                                    # restricted policy text: never a cloud model, even as a fallback
+        return LLM.local_only(budget=llm.budget, tracer=llm.tracer)
+    return LLM.small(budget=llm.budget, tracer=llm.tracer)
+
+
+def _grade(grader_llm: LLM, local_only: bool, system: str, user: str, stage: str, mock) -> GradeResult:
+    try:
+        return grader_llm.structured(system, user, GradeResult, stage=stage, mock=mock)
+    except LLMError:
+        if not local_only:
+            raise
+        # The local model is down and the text may not go anywhere else: fall back to the rule grader.
+        return LLM(provider="mock", budget=grader_llm.budget, tracer=grader_llm.tracer).structured(
+            system, user, GradeResult, stage=stage, mock=mock)
+
+
+def grade_relevance(question: str, context: str, llm: Optional[LLM] = None, *, local_only: bool = False) -> GradeResult:
     def mock() -> dict:
         q_toks = set(tokenize(question))
         c_toks = set(tokenize(context))
@@ -54,17 +73,11 @@ def grade_relevance(question: str, context: str, llm: Optional[LLM] = None) -> G
             "reason": f"overlap={overlap} (needed>={needed}) across terms and semantic concepts",
         }
 
-    grader_llm = LLM.small(budget=llm.budget, tracer=llm.tracer) if (llm and not llm.mock_mode) else (llm or LLM())
-    return grader_llm.structured(
-        RELEVANCE_SYSTEM,
-        f"Question: {question}\n\nContext:\n{context[:6000]}",
-        GradeResult,
-        stage="grade_relevance",
-        mock=mock,
-    )
+    return _grade(_grader_llm(llm, local_only), local_only, RELEVANCE_SYSTEM,
+                  f"Question: {question}\n\nContext:\n{context[:6000]}", "grade_relevance", mock)
 
 
-def grade_grounded(answer: str, sources: str, llm: Optional[LLM] = None) -> GradeResult:
+def grade_grounded(answer: str, sources: str, llm: Optional[LLM] = None, *, local_only: bool = False) -> GradeResult:
     def mock() -> dict:
         src = set(tokenize(sources))
         body = re.sub(r"^[A-Z]{1,5}(?:-[\dA-Z]+)+(?:\.\d+)*:\s*", "", answer)
@@ -81,14 +94,8 @@ def grade_grounded(answer: str, sources: str, llm: Optional[LLM] = None) -> Grad
             "reason": ("all sentences supported" if not unsupported else f"unsupported claim: {unsupported[0][:80]}"),
         }
 
-    grader_llm = LLM.small(budget=llm.budget, tracer=llm.tracer) if (llm and not llm.mock_mode) else (llm or LLM())
-    return grader_llm.structured(
-        GROUNDED_SYSTEM,
-        f"Sources:\n{sources[:8000]}\n\nAnswer:\n{answer}",
-        GradeResult,
-        stage="grade_grounded",
-        mock=mock,
-    )
+    return _grade(_grader_llm(llm, local_only), local_only, GROUNDED_SYSTEM,
+                  f"Sources:\n{sources[:8000]}\n\nAnswer:\n{answer}", "grade_grounded", mock)
 
 
 def grade_policy_answer(
@@ -101,8 +108,12 @@ def grade_policy_answer(
     if pa.abstained or not pa.citations:
         return pa
 
+    # Restricted clauses (Security / Procurement only) may be graded by a model on this machine or by rules, never by a cloud model.
+    def restricted() -> bool:
+        return any(not (set(h.access) & PolicyLibrary.PUBLIC_GROUPS) for h in pa.citations)
+
     ctx = "\n\n".join(f"{h.clause_id} {h.heading}\n{h.text}" for h in pa.citations)
-    rel = grade_relevance(pa.question, ctx, llm)
+    rel = grade_relevance(pa.question, ctx, llm, local_only=restricted())
     pa.grader_relevant = rel.verdict
 
     # Retry 1: if relevance failed and we have the library, broaden search (k=8 + expanded query)
@@ -113,15 +124,15 @@ def grade_policy_answer(
             pa.citations = wider_hits
             ctx = "\n\n".join(f"{h.clause_id} {h.heading}\n{h.text}" for h in pa.citations)
             pa.answer = library._extractive_answer(pa.question, wider_hits)
-            pa.grader_relevant = grade_relevance(pa.question, ctx, llm).verdict
+            pa.grader_relevant = grade_relevance(pa.question, ctx, llm, local_only=restricted()).verdict
 
-    grd = grade_grounded(pa.answer, ctx, llm)
+    grd = grade_grounded(pa.answer, ctx, llm, local_only=restricted())
     pa.grader_grounded = grd.verdict
 
     # Retry 2: if hallucination grader caught unsupported claims, try strict extractive regeneration once
     if not pa.grader_grounded and library is not None and pa.citations:
         strict_ans = library._extractive_answer(pa.question, pa.citations)
-        if grade_grounded(strict_ans, ctx, llm).verdict and pa.mode == "llm":
+        if grade_grounded(strict_ans, ctx, llm, local_only=restricted()).verdict and pa.mode == "llm":
             pa.answer = strict_ans
             pa.grader_grounded = True
 
