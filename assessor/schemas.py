@@ -299,12 +299,30 @@ class AssessmentRequest(BaseModel):
 Overall = Literal["BLOCKED", "CONDITIONAL", "READY_FOR_APPROVAL"]
 
 
+class ApprovalDecision(BaseModel):
+    """One named person signing in one approver role (AI-5.1). T3 needs two of these, from two people."""
+
+    user: str
+    role: str
+    decision: Literal["approve", "reject"]
+    decided_at: str = ""          # ISO timestamp, UTC
+    comment: str = ""
+    method: str = "api"           # api | ui | cli
+
+
 class Approval(BaseModel):
     status: Literal["pending", "approved", "rejected", "not_required"] = "pending"
     approver_roles: list[str] = Field(default_factory=list)
+    decisions: list[ApprovalDecision] = Field(default_factory=list)
+    # Derived from `decisions` for display and older readers: who signed, and when the outcome became final.
     decided_by: Optional[str] = None
     decided_on: Optional[date] = None
     comment: str = ""
+
+    @property
+    def pending_roles(self) -> list[str]:
+        signed = {d.role for d in self.decisions if d.decision == "approve"}
+        return [r for r in self.approver_roles if r not in signed]
 
 
 class AssessmentReport(BaseModel):
@@ -320,3 +338,5 @@ class AssessmentReport(BaseModel):
     cost_usd: float = 0.0
     llm_calls: int = 0
     duration_s: float = 0.0
+    # What produced this report: policy/rules/prompt hashes, models, code version, caches used (governance).
+    provenance: dict[str, Any] = Field(default_factory=dict)

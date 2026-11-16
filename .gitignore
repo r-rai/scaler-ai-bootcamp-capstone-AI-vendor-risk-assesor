@@ -23,3 +23,7 @@ Thumbs.db
 
 # Windows download metadata
 *:Zone.Identifier
+
+# local caches and models
+runs/cache/
+models/

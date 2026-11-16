@@ -11,6 +11,8 @@ Stores:
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +21,7 @@ from .config import RUNS_DIR
 from .schemas import VendorProfile
 
 MEMORY_FILE = RUNS_DIR / "vendor_memory.json"
+_SAVE_LOCK = threading.Lock()
 
 
 class VendorMemory:
@@ -32,8 +35,13 @@ class VendorMemory:
                 pass
 
     def save(self) -> None:
+        """Atomic: write a temp file, then rename. A crash mid-write can no longer truncate the memory."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(self.data, indent=2, default=str, ensure_ascii=False)
+        with _SAVE_LOCK:
+            tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, self.path)
 
     def get_vendor_snapshot(self, vendor: str) -> Optional[dict]:
         return self.data.get("vendors", {}).get(vendor.lower())

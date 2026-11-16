@@ -17,25 +17,44 @@ Milestone 5 complete:
 
 from __future__ import annotations
 
+import threading
 import time
-from datetime import date
 from typing import Any, Callable, Optional, TypedDict
 
+from . import observability as obs
+from . import provenance
+from .cache import get_cache, question_anchors, semantic_scope
+from .approvals import ApprovalError, apply_decision
+from .auth import APPROVERS
 from .config import SETTINGS
-from .db import save_assessment
+from .db import audit, save_assessment
+from .errors import record_error
 from .graders import grade_policy_answer
-from .guardrails import check_intent, enforce_output_policy, redact_input
+from .guardrails import check_intent, enforce_answer_policy, enforce_output_policy, redact_input
 from .llm import LLM
 from .matcher import Matcher
 from .policy_rag import PolicyLibrary
 from .questionnaire import as_email, build_questions
 from .report import to_markdown
 from .router import decide
-from .schemas import Approval, AssessmentReport, AssessmentRequest
+from .schemas import Approval, AssessmentReport, AssessmentRequest, PolicyAnswer
 from .tracing import Budget, Tracer
 from .vendor_research import VendorResearcher
 
-APPROVERS = {"T1": ["Team lead"], "T2": ["Head of Information Security"], "T3": ["Head of Information Security", "DPO"]}
+_SHARED: dict[str, Any] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def shared_components() -> dict[str, Any]:
+    """Build the expensive, read-only parts once per process: the policy index with its embedder and reranker.
+
+    A service must not reload models and re-embed the policy library on every request. Per-request state
+    (Budget, Tracer, VendorResearcher) is still created fresh, so runs cannot see each other's spend or trace.
+    """
+    with _SHARED_LOCK:
+        if "library" not in _SHARED:
+            _SHARED["library"] = PolicyLibrary()
+        return {"library": _SHARED["library"]}
 
 
 class State(TypedDict, total=False):
@@ -50,6 +69,7 @@ class State(TypedDict, total=False):
     requested_by: str
     interactive: bool
     approver: Optional[str]
+    approver_role: Optional[str]
     decision: Optional[str]
     route: Optional[str]
     refusal: Optional[str]
@@ -65,17 +85,37 @@ class State(TypedDict, total=False):
     answer: Optional[str]
     guardrail_notes: list[str]
     started: float
+    refresh: bool
+    cache_hit: bool
 
 
 def new_state(question: str, *, user_groups: list[str] | None = None, tier: str = "T3", users: int = 1,
               vendor: str | None = None, domain: str | None = None, requested_by: str = "cli",
-              interactive: bool = False, approver: str | None = None, decision: str | None = None) -> dict:
+              interactive: bool = False, approver: str | None = None, decision: str | None = None,
+              approver_role: str | None = None, refresh: bool = False) -> dict:
     return {"question": question, "user_groups": user_groups or ["public", "employees"], "tier": tier, "users": users,
             "vendor": vendor, "domain": domain, "requested_by": requested_by, "interactive": interactive,
-            "approver": approver, "decision": decision,
+            "approver": approver, "approver_role": approver_role, "decision": decision,
             "route": None, "refusal": None, "policy_answer": None, "profile": None, "results": None, "overall": None,
             "overall_reason": None, "open_questions": [], "approval": None, "report": None, "answer": None,
-            "guardrail_notes": [], "started": time.time()}
+            "guardrail_notes": [], "started": time.time(), "refresh": refresh, "cache_hit": False}
+
+
+NODE_NAMES = frozenset({"guard_input", "route", "policy_qa", "vendor_research", "facts_only", "match", "questionnaire",
+                        "human_gate", "report", "refuse"})
+
+
+def _timed_node(pipe: "Pipeline", name: str, fn: Callable[[dict], dict]) -> Callable[[dict], dict]:
+    def run(s: dict) -> dict:
+        t0 = time.perf_counter()
+        with obs.span(f"node.{name}", **{"vra.run_id": pipe.tracer.run_id if pipe.tracer else ""}):
+            try:
+                return fn(s)
+            finally:
+                obs.on_trace_event(pipe.tracer.run_id if pipe.tracer else "", "node",
+                                   {"name": name, "duration_ms": round((time.perf_counter() - t0) * 1000, 2)})
+    run.__name__ = name
+    return run
 
 
 class Pipeline:
@@ -95,6 +135,14 @@ class Pipeline:
         self.llm = LLM(budget=self.budget, tracer=tracer)
         self.known_vendors = list(self.researcher.web.vendors)
         self.on_step = on_step
+        self.cache = get_cache()
+
+    def __getattribute__(self, name: str) -> Any:
+        # Every node is timed and traced the same way under both engines, without touching node logic.
+        attr = object.__getattribute__(self, name)
+        if name in NODE_NAMES and callable(attr):
+            return _timed_node(self, name, attr)
+        return attr
 
     def _t(self, stage: str, **data: Any) -> None:
         if self.tracer:
@@ -102,14 +150,17 @@ class Pipeline:
         if self.on_step:
             try:
                 self.on_step(stage, data)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                record_error("graph:on_step", exc, {"stage": stage})
 
     # ------------------------------------------------------------------ nodes
     def guard_input(self, s: dict) -> dict:
+        self.budget.restart_clock()   # the wall-clock limit is per question, even on a shared Pipeline
         q, notes = redact_input(s["question"])
         refusal = check_intent(q, llm=self.llm)
         self._t("guard_input", redactions=notes, refused=bool(refusal))
+        if refusal and self.tracer:
+            audit("guardrail.refused", s.get("requested_by") or "unknown", self.tracer.run_id, {"reason": refusal[:200]})
         return {"question": q, "guardrail_notes": s["guardrail_notes"] + notes, "refusal": refusal,
                 "route": "refuse" if refusal else None}
 
@@ -125,15 +176,41 @@ class Pipeline:
         return {"route": d.route, "vendor": d.vendor or s.get("vendor")}
 
     def policy_qa(self, s: dict) -> dict:
+        # Semantic cache (policy route only). It sits AFTER guard_input and route, so redaction and refusals
+        # always run, and it is scoped by ACL groups + policy/prompt/model version (see cache.py).
+        scope = anchors = q_vec = None
+        if self.cache.enabled:
+            scope = semantic_scope(s["user_groups"], provenance.policy_corpus_hash(str(self.library.policy_dir)),
+                                   provenance.prompt_set_hash(), provenance.models_in_use()["main"])
+            anchors = question_anchors(s["question"], self.known_vendors)
+            q_vec = self.library.embedder.encode([s["question"]])[0]
+            hit = self.cache.semantic_get(scope, anchors, q_vec, SETTINGS.semantic_cache_threshold)
+            self._t("cache", cache="semantic", hit=bool(hit), similarity=hit["similarity"] if hit else None)
+            if hit:
+                pa = PolicyAnswer.model_validate(hit["value"]["policy_answer"])
+                tok = hit["value"].get("tokens") or [0, 0]
+                if tok[0] and not self.llm.mock_mode:   # record the cloud call this hit avoided
+                    self.budget.charge(tok[0], tok[1], model=self.llm.model, role="main", stage="policy_qa",
+                                       provider=self.llm.provider, cached=True)
+                return {"policy_answer": pa, "answer": hit["value"]["answer"], "cache_hit": True}
+
+        before = (self.budget.input_tokens, self.budget.output_tokens)
         pa = self.library.answer(s["question"], s["user_groups"], llm=self.llm)
         pa = grade_policy_answer(pa, self.llm, library=self.library, user_groups=s["user_groups"])
         self._t("policy_qa", abstained=pa.abstained, citations=[c.clause_id or c.heading for c in pa.citations[:3]],
                 relevant=pa.grader_relevant, grounded=pa.grader_grounded)
         cites = "\n".join(f"  - {c.clause_id or c.heading} — {c.title} (v{c.version})" for c in pa.citations[:3])
-        return {"policy_answer": pa, "answer": pa.answer + ("\n\nSources:\n" + cites if cites else "")}
+        answer = enforce_answer_policy(pa.answer, s["guardrail_notes"]) + ("\n\nSources:\n" + cites if cites else "")
+        # Only answers that passed BOTH graders are stored. An abstention is never cached: it may be a transient miss.
+        if self.cache.enabled and not pa.abstained and pa.grader_relevant and pa.grader_grounded:
+            self.cache.semantic_put(scope, anchors, s["question"], q_vec, {
+                "policy_answer": pa.model_dump(mode="json"), "answer": answer,
+                "tokens": [self.budget.input_tokens - before[0], self.budget.output_tokens - before[1]],
+            }, SETTINGS.semantic_cache_ttl_s)
+        return {"policy_answer": pa, "answer": answer}
 
     def vendor_research(self, s: dict) -> dict:
-        profile = self.researcher.research(s["vendor"], s.get("domain"))
+        profile = self.researcher.research(s["vendor"], s.get("domain"), refresh=bool(s.get("refresh")))
         return {"profile": profile}
 
     def facts_only(self, s: dict) -> dict:
@@ -144,7 +221,7 @@ class Pipeline:
         if pf.quarantined:
             lines.append(f"- {len(pf.quarantined)} page(s) quarantined for prompt injection and ignored.")
         lines.append("Note: these are facts, not a policy verdict. Ask 'Can <team> use <tool>...' for an assessment.")
-        return {"answer": "\n".join(lines)}
+        return {"answer": enforce_answer_policy("\n".join(lines), s["guardrail_notes"])}
 
     def match(self, s: dict) -> dict:
         req = AssessmentRequest(question=s["question"], vendor=s["vendor"], official_domain=s["profile"].official_domain,
@@ -161,20 +238,25 @@ class Pipeline:
 
     def human_gate(self, s: dict) -> dict:
         """A person decides. Offline/CI: status stays 'pending'. Interactive CLI: ask on the terminal."""
-        roles = APPROVERS.get(s["tier"], [])
+        roles = list(APPROVERS.get(s["tier"], []))
         approval = Approval(status="pending", approver_roles=roles)
         decision = s.get("decision")
         if s.get("interactive") and decision is None:
             print(f"\nOutcome so far: {s['overall']} — {s['overall_reason']}")
             print(f"Approvers for {s['tier']}: {', '.join(roles)}")
             decision = input("Record a decision now? [approve / reject / leave pending]: ").strip().lower() or "pending"
-        if decision in ("approve", "approved") and s["overall"] != "BLOCKED":
-            approval = Approval(status="approved", approver_roles=roles, decided_by=s.get("approver") or "cli-user", decided_on=date.today(),
-                                comment="Recorded via CLI")
-        elif decision in ("approve", "approved") and s["overall"] == "BLOCKED":
-            approval.comment = "Approval refused by the gate: a blocking requirement failed. Resolve it or change the data tier."
-        elif decision in ("reject", "rejected"):
-            approval = Approval(status="rejected", approver_roles=roles, decided_by=s.get("approver") or "cli-user", decided_on=date.today())
+        if decision in ("approve", "approved", "reject", "rejected"):
+            # A decision typed at the CLI goes through the same rules as the API and UI (approvals.py).
+            # The CLI operator states which approver role they sign in; T3 still needs the second signature.
+            draft = AssessmentReport(request=s["request"], profile=s["profile"], results=s["results"], overall=s["overall"],
+                                     overall_reason=s["overall_reason"], approval=approval)
+            role = s.get("approver_role") or (roles[0] if roles else None)
+            try:
+                apply_decision(draft, user=s.get("approver") or "cli-user", roles=[role] if role else [], decision=decision,
+                               comment="Recorded via CLI", method="cli", role=role)
+                approval = draft.approval
+            except ApprovalError as exc:
+                approval.comment = f"Approval refused by the gate: {exc.message}"
         self._t("human_gate", status=approval.status, decided_by=approval.decided_by)
         return {"approval": approval}
 
@@ -183,7 +265,10 @@ class Pipeline:
                                overall_reason=s["overall_reason"], open_questions=s["open_questions"], approval=s["approval"],
                                guardrail_notes=list(s["guardrail_notes"]), run_id=self.tracer.run_id if self.tracer else "",
                                cost_usd=round(self.budget.spent_usd, 4), llm_calls=self.budget.llm_calls,
-                               duration_s=round(time.time() - s["started"], 2))
+                               duration_s=round(time.time() - s["started"], 2),
+                               provenance=provenance.stamp(embedder=self.library.embedder.backend,
+                                                           reranker=self.library.reranker.backend,
+                                                           extra={"budget": self.budget.summary()}))
         before = [r.verdict for r in rep.results]
         rep = enforce_output_policy(rep)
         if [r.verdict for r in rep.results] != before:   # a downgrade changes the outcome too
@@ -197,9 +282,12 @@ class Pipeline:
             if email:
                 self.tracer.write_text("vendor_questions.txt", email)
         try:
-            save_assessment(rep)
-        except Exception:  # noqa: BLE001
-            pass
+            save_assessment(rep, audit_actor=rep.request.requested_by)
+        except Exception as exc:  # noqa: BLE001
+            record_error("graph:save_assessment", exc, {"run_id": rep.run_id})
+        for d in rep.approval.decisions if rep.run_id else []:   # a decision recorded at the CLI gate
+            audit(f"approval.{d.decision}", d.user, rep.run_id, {"role": d.role, "method": d.method,
+                                                                    "status_after": rep.approval.status})
         self._t("report", overall=rep.overall, run_dir=str(self.tracer.dir) if self.tracer else None)
         return {"report": rep, "answer": md}
 

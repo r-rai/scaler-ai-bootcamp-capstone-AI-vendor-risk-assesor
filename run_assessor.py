@@ -21,7 +21,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+from assessor import observability as obs
 from assessor.config import SETTINGS
+from assessor.costs import SpendCapExceeded, check_spend_caps
+from assessor.db import save_usage
+from assessor.errors import record_error
 from assessor.graph import Pipeline, new_state
 from assessor.tracing import Budget, Tracer
 
@@ -45,13 +49,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--interactive", action="store_true", help="Ask for a human decision on the terminal")
     ap.add_argument("--decision", choices=["approve", "reject", "pending"], help="Record a decision without prompting")
     ap.add_argument("--approver", help="Name recorded with the decision")
+    ap.add_argument("--approver-role", help="Approver role the named person signs in (AI-5.1), e.g. 'DPO'. T3 needs two signatures.")
     ap.add_argument("--engine", default="auto", choices=["auto", "plain", "langgraph"])
     ap.add_argument("--max-usd", type=float, default=None, help="Hard budget for live LLM calls")
+    ap.add_argument("--refresh", action="store_true", help="Re-review: ignore cached searches and pages")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
 
     if a.quiet:
         SETTINGS.verbose = False
+    try:
+        check_spend_caps()
+    except SpendCapExceeded as exc:
+        print(f"Refused: {exc}")
+        return 2
     budget = Budget(max_usd=a.max_usd) if a.max_usd is not None else Budget()
     tracer = Tracer("assess")
     print(f"LLM_PROVIDER={SETTINGS.llm_provider}  SEARCH_PROVIDER={SETTINGS.search_provider}  run={tracer.run_id}")
@@ -59,11 +70,17 @@ def main(argv: list[str] | None = None) -> int:
     pipe = Pipeline(tracer=tracer, budget=budget)
     state = new_state(a.question, user_groups=[g.strip() for g in a.groups.split(",") if g.strip()], tier=a.tier,
                       users=a.users, vendor=a.vendor, domain=a.domain, requested_by=a.requested_by,
-                      interactive=a.interactive, approver=a.approver, decision=a.decision)
+                      interactive=a.interactive, approver=a.approver, decision=a.decision,
+                      approver_role=a.approver_role, refresh=a.refresh)
     try:
         state = pipe.run(state, engine=a.engine)
+    except Exception as exc:  # noqa: BLE001
+        record_error("cli:run_assessor", exc, {"question": a.question, "vendor": a.vendor, "tier": a.tier, "run_id": tracer.run_id})
+        raise
     finally:
         tracer.close()
+        save_usage(tracer.run_id, budget.calls, route=str(state.get("route") or ""), tools=budget.tools)
+        obs.observe_run(state, budget)
 
     print("\n" + "=" * 78)
     print(state["answer"])

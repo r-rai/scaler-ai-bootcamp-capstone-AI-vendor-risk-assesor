@@ -130,3 +130,18 @@ def enforce_output_policy(report: AssessmentReport) -> AssessmentReport:
         report.approval.status = "pending"
         notes.append("output: approval without a named approver reset to pending")
     return report
+
+
+def enforce_answer_policy(text: str, notes: list[str] | None = None) -> str:
+    """Output guardrail for free-text answers (policy Q&A, vendor facts): the same wording rule as reports,
+    plus a last check that no secret or personal identifier is echoed back to the user."""
+    notes = notes if notes is not None else []
+    if FORBIDDEN_OUTPUT.search(text):
+        text = FORBIDDEN_OUTPUT.sub("[wording removed by output guardrail]", text)
+        notes.append("output: approval-like wording removed from the answer")
+    for name in ("api_key", "card_number", "aadhaar_like", "pan_in"):
+        pat = SECRET_PATTERNS[name]
+        if pat.search(text):
+            text = pat.sub(f"[{name.upper()} REDACTED]", text)
+            notes.append(f"output: {name} redacted from the answer")
+    return text

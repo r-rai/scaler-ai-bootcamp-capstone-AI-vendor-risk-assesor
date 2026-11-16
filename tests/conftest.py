@@ -1,8 +1,21 @@
+import os
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
 import pytest
+
+# Force the deterministic, free configuration BEFORE assessor.config is imported: a local .env that
+# selects a live provider must never make the suite call a real API. Run outputs go to a temp folder.
+os.environ["LLM_PROVIDER"] = "mock"
+os.environ["SEARCH_PROVIDER"] = "offline"
+os.environ["VRA_ENV"] = "dev"
+os.environ["VRA_CACHE"] = "0"          # caches are off unless a test builds one explicitly
+os.environ["VRA_LOG_LEVEL"] = "WARNING"
+os.environ.setdefault("VRA_RUNS_DIR", tempfile.mkdtemp(prefix="vra-test-runs-"))
+for _k in ("LLM_SMALL_PROVIDER", "LLM_EXTRACT_PROVIDER", "VRA_TOKENS_FILE"):
+    os.environ.pop(_k, None)
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:

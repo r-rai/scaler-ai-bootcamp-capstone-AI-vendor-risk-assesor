@@ -6,6 +6,14 @@ Two modes:
   simple rules, so the whole project runs offline and the tests are repeatable.
 * live: any OpenAI-compatible provider (including MiniMax at https://api.minimax.io/v1). Set LLM_PROVIDER in .env.
 
+Roles and routing (live mode):
+* main    — planning, query generation, grounded policy answers      (LLM_PROVIDER)
+* small   — routing, grading, identity gate, injection classifier    (LLM_SMALL_PROVIDER, e.g. llamacpp)
+* extract — claim extraction from web pages                          (LLM_EXTRACT_PROVIDER)
+A role served by a local provider falls back to the main provider's small model when the local server
+is down or slow; a circuit breaker stops every call from waiting on a dead server. Every call is charged
+to the shared Budget with its model, role and stage, which is what the cost dashboard reads.
+
 The method that matters is `structured()`: ask for JSON, validate it with a Pydantic schema, and if
 validation fails send the error back and ask the model to repair its output. This validate → repair loop
 is what turns fragile LLM output into a contract (Deep Search Module 4, Lab 2).
@@ -15,6 +23,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from typing import Callable, Type, TypeVar
 
 from pydantic import ValidationError
@@ -23,11 +33,54 @@ from .config import SETTINGS
 from .schemas import BaseModel
 from .tracing import Budget, Tracer, estimate_tokens
 
-T = TypeVar("T", bound=BaseModel)
-
-
 class LLMError(RuntimeError):
     pass
+
+
+BREAKER_THRESHOLD = 3      # consecutive failures before a provider is skipped
+BREAKER_COOLDOWN_S = 60.0
+_BREAKERS: dict[str, dict[str, float]] = {}
+_CLIENTS: dict[tuple[str, str], object] = {}
+_STATE_LOCK = threading.Lock()
+
+
+def breaker_open(provider: str) -> bool:
+    with _STATE_LOCK:
+        b = _BREAKERS.get(provider)
+        return bool(b and b["open_until"] > time.time())
+
+
+def _breaker_record(provider: str, ok: bool) -> None:
+    with _STATE_LOCK:
+        b = _BREAKERS.setdefault(provider, {"fails": 0, "open_until": 0.0})
+        if ok:
+            b["fails"], b["open_until"] = 0, 0.0
+        else:
+            b["fails"] += 1
+            if b["fails"] >= BREAKER_THRESHOLD:
+                b["open_until"] = time.time() + BREAKER_COOLDOWN_S
+
+
+def reset_breakers() -> None:
+    with _STATE_LOCK:
+        _BREAKERS.clear()
+
+
+def _client(cfg: dict):
+    """One OpenAI-compatible client per endpoint, shared across threads and requests (connection reuse)."""
+    key = (cfg["base_url"], cfg["api_key"])
+    with _STATE_LOCK:
+        if key not in _CLIENTS:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:  # pragma: no cover
+                raise LLMError("Live mode needs the openai package: pip install openai") from exc
+            # The SDK retries connection errors, 408/429 and 5xx with exponential backoff and jitter.
+            _CLIENTS[key] = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], timeout=SETTINGS.llm_timeout_s,
+                                   max_retries=0 if cfg.get("local") else 2)
+        return _CLIENTS[key]
+
+T = TypeVar("T", bound=BaseModel)
 
 
 def clean_reasoning(text: str) -> str:
@@ -66,74 +119,166 @@ def _extract_json(text: str) -> str:
 
 
 class LLM:
-    def __init__(self, budget: Budget | None = None, tracer: Tracer | None = None, model: str | None = None, role: str = "main"):
+    def __init__(self, budget: Budget | None = None, tracer: Tracer | None = None, model: str | None = None, role: str = "main",
+                 provider: str | None = None):
         self.budget = budget or Budget()
         self.tracer = tracer
-        self.provider = SETTINGS.llm_provider
-        self.mock_mode = self.provider == "mock"
         self.role = role
-        self._client = None
+        self.provider = (provider or SETTINGS.provider_for(role)).lower()
+        if SETTINGS.llm_provider == "mock" and provider is None:
+            self.provider = "mock"
+        self.mock_mode = self.provider == "mock"
+        self.targets: list[dict] = []          # ordered: preferred endpoint first, then fallbacks
         if self.mock_mode:
             self.model = "mock-llm"
+            self.local = False
         else:
-            cfg = SETTINGS.resolved_llm(role=role)
-            self.model = model or cfg["model"]
-            try:
-                from openai import OpenAI
-            except ImportError as exc:  # pragma: no cover
-                raise LLMError("Live mode needs the openai package: pip install openai") from exc
-            self._client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], timeout=90, max_retries=2)
+            cfg = SETTINGS.resolved_llm(role=role, provider=self.provider)
+            if model:
+                cfg["model"] = model
+            self.targets.append(cfg)
+            # A non-main role on another provider (typically a local server) can fall back to the main provider.
+            if SETTINGS.llm_fallback and provider is None and self.provider != SETTINGS.llm_provider and SETTINGS.llm_provider != "mock":
+                try:
+                    self.targets.append(SETTINGS.resolved_llm(role="small", provider=SETTINGS.llm_provider))
+                except ValueError:
+                    pass
+            self.model = cfg["model"]
+            self.local = bool(cfg.get("local"))
 
     @classmethod
     def small(cls, budget: Budget | None = None, tracer: Tracer | None = None) -> "LLM":
-        """A cheaper, faster model for high-volume jobs such as claim extraction, routing, and grading (e.g. MiniMax-M3.1-Flash)."""
-        return cls(budget=budget, tracer=tracer, model=SETTINGS.llm_small_model or None, role="small")
+        """A cheaper, faster model for high-volume decisions: routing, grading, identity, injection classification."""
+        return cls(budget=budget, tracer=tracer, role="small")
+
+    @classmethod
+    def extractor(cls, budget: Budget | None = None, tracer: Tracer | None = None) -> "LLM":
+        """The model that reads web pages and returns typed claims (LLM_EXTRACT_PROVIDER)."""
+        return cls(budget=budget, tracer=tracer, role="extract")
+
+    @classmethod
+    def for_bugfix(cls, budget: Budget | None = None, tracer: Tracer | None = None) -> "LLM":
+        """The bug-fix agent's model. BUGFIX_LLM_PROVIDER / BUGFIX_LLM_MODEL override the main settings."""
+        return cls(budget=budget or Budget(max_usd=SETTINGS.bugfix_max_usd, max_seconds=0, max_tool_calls=0), tracer=tracer,
+                   model=SETTINGS.bugfix_model or None, role="main", provider=SETTINGS.bugfix_provider or None)
+
+    # ------------------------------------------------------------------ transport
+    def _trace(self, stage: str, **data) -> None:
+        if self.tracer:
+            self.tracer.event(stage, **data)
+
+    def _create(self, cfg: dict, messages: list[dict], *, json_mode: bool = False, schema: dict | None = None,
+                schema_name: str = "output", tools: list[dict] | None = None):
+        kwargs: dict = {"model": cfg["model"], "messages": messages}
+        if tools:
+            kwargs["tools"], kwargs["tool_choice"] = tools, "auto"
+        if SETTINGS.llm_temperature is not None:
+            temp = SETTINGS.llm_temperature
+            # Older MiniMax gateways reject temperature 0.0.
+            if cfg["provider"] == "minimax" and temp <= 0.0:
+                temp = 0.01
+            kwargs["temperature"] = temp
+        if schema is not None and cfg["provider"] == "llamacpp":
+            # llama.cpp compiles the JSON Schema to a grammar: the small model cannot emit invalid JSON.
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name, "schema": schema}}
+        elif json_mode and cfg["provider"] != "ollama":
+            kwargs["response_format"] = {"type": "json_object"}
+        client = _client(cfg)
+        try:
+            return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — some providers reject response_format; retry once without it
+            if "response_format" not in kwargs:
+                raise
+            kwargs.pop("response_format")
+            return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+
+    def _complete(self, messages: list[dict], *, stage: str, **kw):
+        """Try each target in order, skipping providers whose circuit breaker is open."""
+        self.budget.check()   # cooperative stop: never start a call the budget cannot pay for
+        last: Exception | None = None
+        for i, cfg in enumerate(self.targets):
+            if breaker_open(cfg["provider"]) and i < len(self.targets) - 1:
+                self._trace("llm_fallback", llm_stage=stage, skipped=cfg["provider"], reason="circuit open")
+                continue
+            t0 = time.time()
+            try:
+                resp = self._create(cfg, messages, **kw)
+                _breaker_record(cfg["provider"], True)
+                return resp, cfg, round((time.time() - t0) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                _breaker_record(cfg["provider"], False)
+                last = exc
+                if i < len(self.targets) - 1:
+                    self._trace("llm_fallback", llm_stage=stage, failed=cfg["provider"], error=str(exc)[:160],
+                                next=self.targets[i + 1]["provider"])
+        raise LLMError(f"LLM call failed at stage {stage!r}: {last}") from last
+
+    def _account(self, resp, cfg: dict, ms: int, *, stage: str, in_est: int, raw: str, **extra) -> None:
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "prompt_tokens", None) or in_est
+        out_tok = getattr(usage, "completion_tokens", None) or estimate_tokens(raw)
+        self._trace("llm", llm_stage=stage, model=cfg["model"], provider=cfg["provider"], role=self.role,
+                    input_tokens=in_tok, output_tokens=out_tok, duration_ms=ms, **extra)
+        self.budget.charge(in_tok, out_tok, model=cfg["model"], role=self.role, stage=stage, provider=cfg["provider"],
+                           local=bool(cfg.get("local")))
 
     # ------------------------------------------------------------------
+    def chat_tools(self, messages: list[dict], tools: list[dict], *, stage: str = "tools",
+                   mock: Callable[[], dict] | None = None) -> dict:
+        """One tool-calling turn. Returns {"content", "tool_calls": [{id,name,arguments(str)}], "message"}.
+
+        `message` is the assistant message to append to history verbatim (tool-call continuity).
+        In mock mode `mock()` returns {"content": str, "tool_calls": [{"name","arguments": dict|str}]}.
+        """
+        if self.mock_mode:
+            if mock is None:
+                raise LLMError(f"Stage {stage!r} has no mock implementation.")
+            out = mock()
+            calls = []
+            for i, c in enumerate(out.get("tool_calls") or []):
+                args = c.get("arguments", {})
+                calls.append({"id": c.get("id") or f"mock-{i}", "name": c["name"],
+                              "arguments": args if isinstance(args, str) else json.dumps(args)})
+            content = out.get("content") or ""
+            self.budget.charge(estimate_tokens(json.dumps(messages, default=str)[-4000:]), estimate_tokens(content),
+                               model=self.model, role=self.role, stage=stage, provider="mock")
+            msg: dict = {"role": "assistant", "content": content}
+            if calls:
+                msg["tool_calls"] = [{"id": c["id"], "type": "function",
+                                      "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]
+            return {"content": content, "tool_calls": calls, "message": msg}
+
+        resp, cfg, ms = self._complete(messages, stage=stage, tools=tools)
+        m = resp.choices[0].message
+        raw = m.content or ""
+        calls = [{"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or "{}"}
+                 for tc in (getattr(m, "tool_calls", None) or [])]
+        self._account(resp, cfg, ms, stage=stage, in_est=estimate_tokens(json.dumps(messages, default=str)[-4000:]),
+                      raw=raw, tool_calls=[c["name"] for c in calls])
+        # Keep the assistant message exactly as returned (including any reasoning text) for continuity.
+        msg = {"role": "assistant", "content": raw}
+        if calls:
+            msg["tool_calls"] = [{"id": c["id"], "type": "function",
+                                  "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]
+        return {"content": clean_reasoning(raw) if raw else "", "tool_calls": calls, "message": msg}
+
     def chat(self, system: str, user: str, *, stage: str = "llm", json_mode: bool = False,
-             mock: Callable[[], str] | None = None) -> str:
+             mock: Callable[[], str] | None = None, schema: dict | None = None, schema_name: str = "output") -> str:
         if self.mock_mode:
             if mock is None:
                 raise LLMError(f"Stage {stage!r} has no mock implementation. Set LLM_PROVIDER to a real provider or add a mock.")
             out = mock()
-            self.budget.charge(estimate_tokens(system + user), estimate_tokens(out))
             if self.tracer:
                 self.tracer.event("llm", llm_stage=stage, model=self.model, role=self.role, mock=True)
+            self.budget.charge(estimate_tokens(system + user), estimate_tokens(out), model=self.model, role=self.role,
+                               stage=stage, provider="mock")
             return out
 
-        kwargs: dict = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        }
-        if SETTINGS.llm_temperature is not None:
-            # MiniMax temperature must be in (0.0, 1.0] on some legacy endpoints or [0.0, 2.0] on M3;
-            # if provider is minimax and temperature == 0.0, 0.01 avoids zero-temp rejection on older gateways.
-            temp = SETTINGS.llm_temperature
-            if self.provider == "minimax" and temp <= 0.0:
-                temp = 0.01
-            kwargs["temperature"] = temp
-        if json_mode and self.provider not in ("ollama",):
-            kwargs["response_format"] = {"type": "json_object"}
-        try:
-            resp = self._client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
-        except Exception as exc:  # noqa: BLE001 — fallback without response_format if provider rejects json_object
-            if json_mode and "response_format" in kwargs:
-                kwargs.pop("response_format", None)
-                try:
-                    resp = self._client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
-                except Exception as exc2:  # noqa: BLE001
-                    raise LLMError(f"LLM call failed at stage {stage!r}: {exc2}") from exc2
-            else:
-                raise LLMError(f"LLM call failed at stage {stage!r}: {exc}") from exc
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        resp, cfg, ms = self._complete(messages, stage=stage, json_mode=json_mode, schema=schema, schema_name=schema_name)
         raw_text = resp.choices[0].message.content or ""
-        text = clean_reasoning(raw_text) if not json_mode else raw_text
-        usage = getattr(resp, "usage", None)
-        in_tok = getattr(usage, "prompt_tokens", None) or estimate_tokens(system + user)
-        out_tok = getattr(usage, "completion_tokens", None) or estimate_tokens(raw_text)
-        self.budget.charge(in_tok, out_tok)
-        if self.tracer:
-            self.tracer.event("llm", llm_stage=stage, model=self.model, role=self.role, input_tokens=in_tok, output_tokens=out_tok)
-        return text
+        self._account(resp, cfg, ms, stage=stage, in_est=estimate_tokens(system + user), raw=raw_text)
+        return clean_reasoning(raw_text) if not json_mode else raw_text
 
     def structured(self, system: str, user: str, schema: Type[T], *, stage: str = "llm",
                    mock: Callable[[], dict] | None = None, max_repairs: int = 2) -> T:
@@ -142,17 +287,20 @@ class LLM:
             if mock is None:
                 raise LLMError(f"Stage {stage!r} has no mock implementation.")
             data = mock()
-            self.budget.charge(estimate_tokens(system + user), estimate_tokens(json.dumps(data, default=str)))
             if self.tracer:
                 self.tracer.event("llm", llm_stage=stage, model=self.model, role=self.role, mock=True, schema=schema.__name__)
+            self.budget.charge(estimate_tokens(system + user), estimate_tokens(json.dumps(data, default=str)),
+                               model=self.model, role=self.role, stage=stage, provider="mock")
             return schema.model_validate(data)
 
-        schema_hint = json.dumps(schema.model_json_schema(), indent=0)
+        json_schema = schema.model_json_schema()
+        schema_hint = json.dumps(json_schema, indent=0)
         sys_full = f"{system}\n\nReturn ONLY a valid JSON object that matches this JSON Schema (no markdown fences, no commentary):\n{schema_hint}"
         prompt = user
         last_err = ""
         for attempt in range(max_repairs + 1):
-            raw = self.chat(sys_full, prompt, stage=f"{stage}#{attempt}", json_mode=True)
+            raw = self.chat(sys_full, prompt, stage=f"{stage}#{attempt}", json_mode=True, schema=json_schema,
+                            schema_name=schema.__name__)
             try:
                 return schema.model_validate_json(_extract_json(raw))
             except (ValidationError, ValueError) as exc:

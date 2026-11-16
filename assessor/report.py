@@ -33,6 +33,12 @@ def to_markdown(rep: AssessmentReport) -> str:
     L.append("")
     L.append(f"> This is an input to the review, not an approval. Approvers for {rq.tier}: {', '.join(rep.approval.approver_roles) or 'see AI-5.1'}. "
              f"Approval status: **{rep.approval.status}**" + (f" by {rep.approval.decided_by} on {rep.approval.decided_on}" if rep.approval.decided_by else "") + ".")
+    if rep.approval.decisions:
+        L.append(">")
+        for d in rep.approval.decisions:
+            L.append(f"> - {d.decided_at}: **{d.decision}** by {d.user} as {d.role}" + (f" — {d.comment}" if d.comment else ""))
+        if rep.approval.status == "pending" and rep.approval.pending_roles:
+            L.append(f"> - still required: {', '.join(rep.approval.pending_roles)}")
     L.append("")
 
     L.append("## 1. Vendor identity")
@@ -85,6 +91,16 @@ def to_markdown(rep: AssessmentReport) -> str:
         L.append("## 6. Guardrail notes")
         for n in rep.guardrail_notes:
             L.append(f"- {n}")
+        L.append("")
+
+    if rep.provenance:
+        pv = rep.provenance
+        L.append("## 7. Provenance")
+        L.append(f"- Policy library `{pv.get('policy_corpus', '')}` · requirements `{pv.get('requirements', '')}` · prompts `{pv.get('prompts', '')}` · code `{pv.get('code', '')}`")
+        L.append("- Models: " + ", ".join(f"{k}={v}" for k, v in (pv.get("models") or {}).items())
+                 + f" · embedder: {pv.get('embedder') or 'n/a'} · reranker: {pv.get('reranker') or 'n/a'} · search: {pv.get('search_provider', '')}")
+        if pv.get("cache_hits"):
+            L.append("- Served from cache: " + ", ".join(f"{k}={v}" for k, v in pv["cache_hits"].items()))
         L.append("")
 
     L.append("---")

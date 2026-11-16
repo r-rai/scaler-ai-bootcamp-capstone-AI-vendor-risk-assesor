@@ -1,20 +1,22 @@
 """
-app/ui.py — Streamlit reviewer workstation (Milestone 5).
+app/ui.py — Streamlit reviewer workstation.
 
-Run:   streamlit run app/ui.py          (pip install streamlit)
+Run:   streamlit run app/ui.py
 
-Features:
-  * Streams live node-by-node progress (guard_input → route → vendor_research → match → questionnaire → human_gate → report)
-  * Interactive Verdict → Evidence → Trace explorer so a reviewer can inspect every page accepted, rejected, or quarantined
-  * Human Approval / Rejection gate form (blocks approval when Outcome is BLOCKED, records decision to report.json + SQLite)
-  * Vendor History & SEC-12.1 diff tab + Observability Metrics tab (p50/p95 latency & cost)
+  * Sign in with an API token; ACL groups and approver roles come from the token (assessor/auth.py).
+    In dev mode a demo identity can be picked instead; it can ask and assess but never approve.
+  * Live node-by-node progress, the review file, and a Verdict → Evidence → Trace explorer.
+  * Approval queue and decision form. Decisions go through assessor/approvals.py: the right role for the tier,
+    not the requester, two signatures for T3, never for a BLOCKED outcome.
+  * Vendor history with SEC-12.1 diffs.
+  * Cost dashboard (spend per day / model / stage, local vs cloud, cache savings, caps) and operations view
+    (latency, cache contents, evaluation history, audit-chain status). Works without Docker or Grafana.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,151 +24,269 @@ sys.path.insert(0, str(ROOT))
 
 import streamlit as st  # noqa: E402
 
+from assessor import observability as obs  # noqa: E402
+from assessor.approvals import ApprovalError, load_report, record_decision  # noqa: E402
+from assessor.auth import DEMO_TOKENS, AuthError, Identity, authenticate  # noqa: E402
+from assessor.cache import get_cache  # noqa: E402
 from assessor.config import RUNS_DIR, SETTINGS  # noqa: E402
-from assessor.db import get_recent_metrics, get_vendor_history, save_assessment, update_approval_in_db  # noqa: E402
-from assessor.graph import Pipeline, new_state  # noqa: E402
+from assessor.costs import SpendCapExceeded, check_spend_caps, cost_overview  # noqa: E402
+from assessor.db import (  # noqa: E402
+    get_audit_log, get_eval_history, get_recent_metrics, get_vendor_history, list_assessments, save_usage,
+    verify_audit_chain,
+)
+from assessor.graph import Pipeline, new_state, shared_components  # noqa: E402
 from assessor.report import to_markdown  # noqa: E402
 from assessor.tracing import Budget, Tracer  # noqa: E402
 
 st.set_page_config(page_title="Vendor Risk Assessor — Nimbu Mart", layout="wide")
+obs.setup_logging()
+
+
+@st.cache_resource(show_spinner="Loading the policy index and models…")
+def components() -> dict:
+    return shared_components()
+
+
+def sign_in() -> Identity | None:
+    with st.sidebar:
+        st.header("Who you are")
+        token = st.text_input("API token", type="password", help="Groups and approver roles come from the token, not from this form.")
+        if token:
+            try:
+                ident = authenticate(token.strip())
+            except AuthError as exc:
+                st.error(exc.message)
+                return None
+            st.success(f"{ident.user}")
+            st.caption(f"Groups: {', '.join(ident.groups)}  \nApprover roles: {', '.join(ident.roles) or 'none'}")
+            return ident
+        if SETTINGS.prod:
+            st.info("Sign in with your API token to continue.")
+            return None
+        st.caption("Dev mode: pick a demo identity. Demo identities cannot record decisions; sign in with a demo token "
+                   f"({', '.join(k for k, v in DEMO_TOKENS.items() if v['roles'])}) to approve.")
+        preset = st.selectbox("Demo identity", ["Security Engineer", "Procurement Lead", "General Employee", "Guest"])
+        groups = {"Security Engineer": ("public", "employees", "security"), "Procurement Lead": ("public", "employees", "procurement"),
+                  "General Employee": ("public", "employees"), "Guest": ("public",)}[preset]
+        return Identity(f"demo:{preset}", groups, (), False)
+
+
+ident = sign_in()
 st.title("AI Vendor Risk Assessor")
-st.caption(
-    f"Nimbu Mart · LLM: {SETTINGS.llm_provider} · search: {SETTINGS.search_provider} · "
-    "an input to the review, not an approval (AI-5.1)"
-)
+st.caption(f"Nimbu Mart · env: {SETTINGS.env} · LLM: {SETTINGS.llm_provider}"
+           + (f" (small: {SETTINGS.llm_small_provider})" if SETTINGS.llm_small_provider else "")
+           + f" · search: {SETTINGS.search_provider} · an input to the review, not an approval (AI-5.1)")
+if ident is None:
+    st.stop()
 
 with st.sidebar:
-    st.header("Reviewer Context")
-    role_preset = st.selectbox(
-        "Caller Identity (Server ACL)",
-        ["Security Engineer (security)", "Procurement Lead (procurement)", "General Employee (employees)", "Guest (public)"],
-    )
-    preset_groups = {
-        "Security Engineer (security)": ["public", "employees", "security"],
-        "Procurement Lead (procurement)": ["public", "employees", "procurement"],
-        "General Employee (employees)": ["public", "employees"],
-        "Guest (public)": ["public"],
-    }[role_preset]
-    groups = st.multiselect("Effective ACL Groups", ["public", "employees", "security", "procurement"], default=preset_groups)
+    st.header("Request")
     tier = st.selectbox("Highest data tier", ["T1", "T2", "T3"], index=2)
     users = st.number_input("Number of users", 1, 10000, 35)
     vendor = st.text_input("Vendor (optional, otherwise detected)", "")
     domain = st.text_input("Official domain (optional)", "")
+    refresh = st.checkbox("Re-review: ignore cached pages", value=False)
 
-tab_assess, tab_history, tab_metrics = st.tabs(["Assess / Ask Policy", "Vendor History (SEC-12.1)", "Observability & Cost"])
+
+def show_report(rep, events: list | None = None, where: str = "assess") -> None:
+    colour = {"BLOCKED": "red", "CONDITIONAL": "orange", "READY_FOR_APPROVAL": "green"}[rep.overall]
+    st.markdown(f"### :{colour}[{rep.overall}] — {rep.overall_reason}")
+    st.dataframe([{
+        "Requirement": r.title, "Clause": r.clause, "Verdict": r.verdict, "Severity": r.severity, "Reason": r.reason,
+        "Evidence": ", ".join(r.evidence_urls[:2]) or ("policy library" if r.requirement_id == "PROC-1.1" else "—"),
+        "As of": str(r.evidence_as_of or ""),
+    } for r in rep.results], width="stretch", hide_index=True)
+
+    col_q, col_gate = st.columns([3, 2])
+    with col_q:
+        if rep.open_questions:
+            st.subheader("Questions for the vendor (NM-SEC-Q)")
+            for i, oq in enumerate(rep.open_questions, 1):
+                st.markdown(f"**{i}. {oq['id']}** ({oq['clause']}) — {oq['question']}")
+    with col_gate:
+        decision_form(rep, where)
+
+    with st.expander("Trace & provenance"):
+        st.markdown("**Quarantined (prompt injection):** " + (", ".join(rep.profile.quarantined) or "None"))
+        st.markdown("**Rejected (identity gate):** " + (", ".join(rep.profile.rejected) or "None"))
+        st.markdown("**Dropped (rumours / low authority / empty):** " + ("; ".join(rep.profile.dropped) or "None"))
+        st.json(rep.provenance, expanded=False)
+        if events is None:
+            p = RUNS_DIR / rep.run_id / "trace.jsonl"
+            events = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()] if p.is_file() else []
+        st.json(events, expanded=False)
+    with st.expander("Full review file (Markdown)"):
+        st.markdown(to_markdown(rep))
+    st.caption(f"Run {rep.run_id} · {rep.llm_calls} LLM calls · est. ${rep.cost_usd:.4f} · {rep.duration_s}s")
+
+
+def decision_form(rep, where: str) -> None:
+    ap = rep.approval
+    st.subheader("Human approval gate (AI-5.1)")
+    st.caption(f"Required for {rep.request.tier}: **{', '.join(ap.approver_roles)}**")
+    st.write(f"Status: **{ap.status}**" + (f" · still required: {', '.join(ap.pending_roles)}" if ap.status == "pending" and ap.decisions else ""))
+    for d in ap.decisions:
+        st.write(f"- {d.decided_at}: {d.decision} by {d.user} as {d.role}" + (f" — {d.comment}" if d.comment else ""))
+    if ap.status in ("approved", "rejected"):
+        return
+    my_roles = [r for r in ap.pending_roles if r in ident.roles]
+    if not ident.authenticated:
+        st.info("Sign in with an API token to record a decision.")
+        return
+    if not my_roles:
+        st.info("You do not hold an open approver role for this assessment.")
+        return
+    with st.form(f"gate-{where}-{rep.run_id}"):
+        options = ["reject"] if rep.overall == "BLOCKED" else ["approve", "reject"]
+        if rep.overall == "BLOCKED":
+            st.warning("Outcome is BLOCKED: approval is disabled until the blocking requirements are resolved.")
+        role = st.selectbox("Signing as", my_roles)
+        choice = st.selectbox("Decision", options)
+        comment = st.text_area("Decision notes", value="")
+        if st.form_submit_button(f"Record decision as {ident.user}"):
+            try:
+                new = record_decision(rep.run_id, user=ident.user, roles=ident.roles, decision=choice, comment=comment,
+                                      method="ui", role=role)
+                obs.count_decision(choice, new.status)
+                st.success(f"Recorded. Status is now {new.status}.")
+                st.session_state.pop("last_state", None)
+                st.session_state["open_run"] = rep.run_id
+                st.rerun()
+            except ApprovalError as exc:
+                st.error(exc.message)
+
+
+tab_assess, tab_queue, tab_history, tab_cost, tab_ops = st.tabs(
+    ["Assess / ask policy", "Approval queue", "Vendor history (SEC-12.1)", "Cost", "Operations"])
 
 with tab_assess:
-    q = st.text_input("Question", "Can our support team use LedgerLens AI to summarise customer tickets?")
-    if st.button("Run Assessment / Query", type="primary"):
+    q = st.text_input("Question", "Can our support team use LedgerLens AI to summarise customer tickets?", max_chars=SETTINGS.max_question_chars)
+    if st.button("Run", type="primary"):
+        try:
+            check_spend_caps()
+        except SpendCapExceeded as exc:
+            st.error(str(exc))
+            st.stop()
         SETTINGS.verbose = False
         tracer = Tracer("ui")
-        progress_box = st.status("Starting pipeline…", expanded=True)
+        box = st.status("Starting pipeline…", expanded=True)
+        budget = Budget()
+        pipe = Pipeline(tracer=tracer, budget=budget, **components(),
+                        on_step=lambda stage, data: box.write(f"✓ **{stage}** — `{json.dumps(data, default=str)[:140]}`"))
+        s = new_state(q, user_groups=list(ident.groups), tier=tier, users=int(users), vendor=vendor or None,
+                      domain=domain or None, requested_by=ident.user, refresh=refresh)
+        try:
+            s = pipe.run(s)
+        except Exception as exc:  # noqa: BLE001
+            box.update(label=f"Failed ({tracer.run_id})", state="error")
+            st.error(f"The run failed: {type(exc).__name__}. It was logged for the operator (run {tracer.run_id}).")
+            from assessor.errors import record_error
 
-        def on_step(stage: str, data: dict):
-            progress_box.write(f"✓ **{stage}** — `{json.dumps(data, default=str)[:140]}`")
-
-        pipe = Pipeline(tracer=tracer, budget=Budget(), on_step=on_step)
-        s = pipe.run(
-            new_state(
-                q, user_groups=groups, tier=tier, users=int(users),
-                vendor=vendor or None, domain=domain or None, requested_by=role_preset,
-            )
-        )
-        tracer.close()
-        progress_box.update(label=f"Completed ({tracer.run_id})", state="complete", expanded=False)
+            record_error("ui:run", exc, {"run_id": tracer.run_id})
+            st.stop()
+        finally:
+            tracer.close()
+            save_usage(tracer.run_id, budget.calls, route=str(s.get("route") or ""), tools=budget.tools)
+            obs.observe_run(s, budget)
+        box.update(label=f"Completed ({tracer.run_id})", state="complete", expanded=False)
         st.session_state["last_state"] = s
         st.session_state["last_events"] = list(tracer.events)
+        st.session_state.pop("open_run", None)
 
     s = st.session_state.get("last_state")
-    if s:
-        rep = s.get("report")
-        if rep is None:
-            st.subheader(f"Route: {s['route']}")
+    if st.session_state.get("open_run"):
+        show_report(load_report(st.session_state["open_run"]))
+    elif s:
+        if s.get("report") is None:
+            st.subheader(f"Route: {s['route']}" + (" · served from the semantic cache" if s.get("cache_hit") else ""))
             st.markdown(s["answer"])
         else:
-            colour = {"BLOCKED": "red", "CONDITIONAL": "orange", "READY_FOR_APPROVAL": "green"}[rep.overall]
-            st.markdown(f"### :{colour}[{rep.overall}] — {rep.overall_reason}")
-            rows = [
-                {
-                    "Requirement": r.title,
-                    "Clause": r.clause,
-                    "Verdict": r.verdict,
-                    "Severity": r.severity,
-                    "Reason": r.reason,
-                    "Evidence": ", ".join(r.evidence_urls[:2]) or ("policy library" if r.requirement_id == "PROC-1.1" else "—"),
-                    "As of": str(r.evidence_as_of or ""),
-                }
-                for r in rep.results
-            ]
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            show_report(load_report(s["report"].run_id) if s["report"].run_id else s["report"], st.session_state.get("last_events"))
 
-            col_q, col_gate = st.columns([3, 2])
-            with col_q:
-                if rep.open_questions:
-                    st.subheader("Questions for the vendor (NM-SEC-Q)")
-                    for i, oq in enumerate(rep.open_questions, 1):
-                        st.markdown(f"**{i}. {oq['id']}** ({oq['clause']}) — {oq['question']}")
-            with col_gate:
-                st.subheader("Human Approval Gate (AI-5.1)")
-                st.caption(f"Required approvers for {rep.request.tier}: **{', '.join(rep.approval.approver_roles)}**")
-                st.write(f"Current status: **{rep.approval.status}**")
-                with st.form("human_gate_form"):
-                    approver_name = st.text_input("Approver Full Name", value="")
-                    allowed_decisions = ["reject"] if rep.overall == "BLOCKED" else ["approve", "reject"]
-                    if rep.overall == "BLOCKED":
-                        st.warning("Outcome is BLOCKED: approval is disabled until blocking requirements are resolved.")
-                    decision_choice = st.selectbox("Decision", allowed_decisions)
-                    comment_txt = st.text_area("Decision Notes", value="")
-                    submitted = st.form_submit_button("Record Human Decision")
-                    if submitted:
-                        if not approver_name.strip():
-                            st.error("Please enter the approver's name.")
-                        else:
-                            rep.approval.status = "approved" if decision_choice == "approve" else "rejected"
-                            rep.approval.decided_by = approver_name.strip()
-                            rep.approval.decided_on = date.today()
-                            rep.approval.comment = comment_txt.strip()
-                            run_dir = RUNS_DIR / rep.run_id
-                            if run_dir.exists():
-                                (run_dir / "report.json").write_text(
-                                    json.dumps(rep.model_dump(mode="json"), indent=2, ensure_ascii=False), encoding="utf-8"
-                                )
-                                (run_dir / "report.md").write_text(to_markdown(rep), encoding="utf-8")
-                            save_assessment(rep)
-                            update_approval_in_db(rep.run_id, rep.approval.model_dump(mode="json"))
-                            st.success(f"Recorded {rep.approval.status} by {rep.approval.decided_by}.")
-
-            with st.expander("Interactive Trace & Provenance Tree"):
-                st.markdown("**Quarantined (Prompt Injection):** " + (", ".join(rep.profile.quarantined) or "None"))
-                st.markdown("**Rejected (Identity Gate):** " + (", ".join(rep.profile.rejected) or "None"))
-                st.markdown("**Dropped (Rumours / Low Authority):** " + ("; ".join(rep.profile.dropped) or "None"))
-                st.json(st.session_state.get("last_events", []))
-
-            with st.expander("Full Review File (Markdown)"):
-                st.markdown(to_markdown(rep))
-
-            st.caption(
-                f"Run {rep.run_id} · {rep.llm_calls} LLM calls · est. ${rep.cost_usd:.4f} · "
-                f"{rep.duration_s}s · approvers: {', '.join(rep.approval.approver_roles)}"
-            )
+with tab_queue:
+    st.subheader("Assessments waiting for a decision")
+    pending = [r for r in list_assessments(100, status="pending") if ident.can_read_run(r["requested_by"])]
+    if not pending:
+        st.write("Nothing is waiting.")
+    else:
+        st.dataframe(pending, width="stretch", hide_index=True)
+        pick = st.selectbox("Open a run", [r["run_id"] for r in pending], format_func=lambda rid: next(
+            f"{r['vendor']} · {r['tier']} · {r['overall']} · {rid}" for r in pending if r["run_id"] == rid))
+        if pick:
+            show_report(load_report(pick), where="queue")
 
 with tab_history:
-    st.subheader("Vendor Assessment History & SEC-12.1 Change Diff")
-    hist_vendor = st.text_input("Vendor Name", value="LedgerLens AI")
-    if st.button("Load History"):
-        h = get_vendor_history(hist_vendor)
-        st.write(f"Total assessments recorded for **{h['vendor']}**: {h['count']}")
-        if h["changes_since_previous"]:
-            st.info("Changes since previous assessment: " + "; ".join(h["changes_since_previous"]))
-        st.json(h["history"])
+    st.subheader("Vendor assessment history and SEC-12.1 change diff")
+    if SETTINGS.prod and not ident.privileged:
+        st.info("History is available to Security and Procurement.")
+    else:
+        hist_vendor = st.text_input("Vendor name", value="LedgerLens AI")
+        if st.button("Load history"):
+            h = get_vendor_history(hist_vendor)
+            st.write(f"Assessments recorded for **{h['vendor']}**: {h['count']}")
+            if h["changes_since_previous"]:
+                st.info("Changes since the previous assessment: " + "; ".join(h["changes_since_previous"]))
+            st.json(h["history"], expanded=False)
 
-with tab_metrics:
-    st.subheader("Last 20 Runs — Latency & Cost Budget")
-    m = get_recent_metrics(limit=20)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Runs Tracked", m["runs_counted"])
-    c2.metric("p50 Latency (s)", m["p50_duration_s"])
-    c3.metric("p95 Latency (s)", m["p95_duration_s"])
-    c4.metric("Total Cost (USD)", f"${m['total_cost_usd']:.4f}")
-    if m["recent_runs"]:
-        st.dataframe(m["recent_runs"], use_container_width=True, hide_index=True)
+with tab_cost:
+    st.subheader("LLM cost")
+    if SETTINGS.prod and not ident.privileged:
+        st.info("Cost figures are available to Security and Procurement.")
+    else:
+        days = st.select_slider("Window (days)", [1, 7, 30, 90], value=30)
+        c = cost_overview(days)
+        sm, tot = c["summary"], c["total"]
+        k = st.columns(5)
+        k[0].metric("Spend today", f"${sm['today_usd']:.4f}")
+        k[1].metric("Spend this month", f"${sm['month_usd']:.4f}")
+        k[2].metric("Avg cost / run", f"${c['avg_cost_per_run']:.4f}", help=f"p95 ${c['p95_cost_per_run']:.4f}")
+        k[3].metric("Cloud cost avoided", f"${tot.get('avoided_usd') or 0:.4f}", help="By the local model and by caches, priced at the cloud model's rate")
+        k[4].metric("Local / cached calls", f"{c['shares']['local_call_share']:.0%} / {c['shares']['cached_call_share']:.0%}")
+        for label, cap in (("Daily cap", sm["daily_cap"]), ("Monthly cap", sm["monthly_cap"])):
+            if cap["state"] != "off":
+                st.progress(min(1.0, cap["used_fraction"]), text=f"{label}: {cap['used_fraction']:.0%} of ${cap['limit_usd']:.2f} ({cap['state']})")
+        st.caption(f"Per-assessment cap ${sm['per_run_cap_usd']:.2f} · Tavily searches this month: "
+                   f"{sm['tavily_credits_used']} of {sm['tavily_credits_quota']} free credits")
+        if c["by_day"]:
+            st.markdown("**Spend per day (USD)**")
+            st.bar_chart({r["day"]: r["usd"] for r in c["by_day"]})
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**By model**")
+            st.dataframe(c["by_model"], width="stretch", hide_index=True)
+        with right:
+            st.markdown("**By pipeline stage**")
+            st.dataframe(c["by_stage"], width="stretch", hide_index=True)
+        st.markdown("**Per run**")
+        st.dataframe(c["per_run"], width="stretch", hide_index=True)
+
+with tab_ops:
+    st.subheader("Operations")
+    if SETTINGS.prod and not ident.privileged:
+        st.info("The operations view is available to Security and Procurement.")
+    else:
+        m = get_recent_metrics(limit=50)
+        chain = verify_audit_chain()
+        k = st.columns(4)
+        k[0].metric("Runs tracked", m["runs_counted"])
+        k[1].metric("p50 latency (s)", m["p50_duration_s"])
+        k[2].metric("p95 latency (s)", m["p95_duration_s"], help="Target: under 90 s per live assessment")
+        k[3].metric("Audit chain", "intact" if chain["ok"] else "TAMPERED", help=f"{chain['rows']} records")
+        if not chain["ok"]:
+            st.error(f"Audit log verification failed at record {chain['first_bad_id']}: {chain['problem']}")
+        st.markdown("**Readiness**")
+        st.dataframe([{"check": name, **v} for name, v in obs.readiness_checks().items()], width="stretch", hide_index=True)
+        st.markdown("**Caches**")
+        st.dataframe([{"cache": name, **v} for name, v in get_cache().stats().items()] or [{"cache": "disabled"}],
+                     width="stretch", hide_index=True)
+        ev = get_eval_history(10)
+        if ev:
+            st.markdown("**Evaluation history** (quality drift)")
+            st.dataframe([{"when": e["ts"], "gold set": e["gold_set"], "llm": e["llm_provider"], "passed": bool(e["passed"]),
+                           **{k2: v for k2, v in e["metrics"].items() if isinstance(v, (int, float))}} for e in ev],
+                         width="stretch", hide_index=True)
+        st.markdown("**Recent runs**")
+        st.dataframe(m["recent_runs"], width="stretch", hide_index=True)
+        with st.expander("Audit log (latest 50)"):
+            st.dataframe([{**e, "details": json.dumps(e["details"])[:200]} for e in get_audit_log(50)],
+                         width="stretch", hide_index=True)
