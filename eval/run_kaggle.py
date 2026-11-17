@@ -295,7 +295,21 @@ def main() -> int:
                 w.writerow(["id", "verdict"])
                 for r in test_rows:
                     w.writerow([r["id"], preds.get(r["id"], "UNKNOWN" if not r["id"].endswith("__OVERALL") else "CONDITIONAL")])
-            lines.append(f"- wrote {out / 'submission.csv'} ({len(test_rows)} rows). NOT uploaded.")
+            back = list(csv.DictReader((out / "submission.csv").open(encoding="utf-8")))
+            problems = kp.validate_submission([r["id"] for r in test_rows], [(r["id"], r["verdict"]) for r in back])
+            try:        # the host's own scorer must accept the file: a dummy solution with the right row kinds
+                import pandas as pd
+                dummy = pd.DataFrame({"id": [r["id"] for r in test_rows],
+                                      "verdict": ["CONDITIONAL" if r["id"].endswith("__OVERALL") else "PASS" for r in test_rows]})
+                metric.components(dummy, pd.DataFrame(back))
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"metric.py rejected the file: {exc}")
+            lines.append(f"- wrote {out / 'submission.csv'} ({len(back)} rows). NOT uploaded. Self-check: "
+                         + ("OK (ids match test.csv, no duplicates, valid labels, metric.py accepts it)" if not problems else "FAILED: " + "; ".join(problems)))
+            if problems:
+                (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                print("\n".join(lines))
+                return 1
         else:
             lines.append("- submission.csv NOT written: not every test case is complete.")
     elif not complete:

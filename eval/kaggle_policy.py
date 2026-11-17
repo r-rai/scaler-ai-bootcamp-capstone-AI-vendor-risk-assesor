@@ -405,3 +405,27 @@ def build_facts(items: list[PageClaims], as_of: date, *, subprocessors: str = "n
     if inc is not None:
         m.facts["security_incidents"] = inc
     return m
+
+
+# --------------------------------------------------------------------------------------------- submission self-check
+REQ_VERDICTS = ("PASS", "FAIL", "UNKNOWN", "NEEDS_REVIEW")
+OVERALL_VERDICTS = ("BLOCKED", "CONDITIONAL", "READY_FOR_APPROVAL")
+
+
+def validate_submission(expected_ids: list[str], rows: list[tuple[str, str]]) -> list[str]:
+    """Everything that would make the leaderboard reject (or silently mis-score) a submission. [] means it is well formed."""
+    problems: list[str] = []
+    ids = [i for i, _ in rows]
+    if len(ids) != len(set(ids)):
+        problems.append(f"{len(ids) - len(set(ids))} duplicate ids")
+    missing, extra = set(expected_ids) - set(ids), set(ids) - set(expected_ids)
+    if missing or extra:
+        problems.append(f"ids do not match test.csv ({len(missing)} missing, {len(extra)} unexpected)")
+    if len(rows) != len(expected_ids):
+        problems.append(f"{len(rows)} rows, expected {len(expected_ids)}")
+    for i, v in rows:
+        allowed = OVERALL_VERDICTS if i.endswith("__OVERALL") else REQ_VERDICTS
+        if v not in allowed:
+            problems.append(f"{i}: {v!r} is not one of {allowed}")
+            break
+    return problems

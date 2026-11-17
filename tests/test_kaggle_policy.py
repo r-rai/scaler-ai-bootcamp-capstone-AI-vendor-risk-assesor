@@ -309,3 +309,13 @@ def test_a_region_that_differs_from_the_named_sub_processors_country_is_kept():
         claim("subprocessors", [_sp("Stratus Grid", "Canada")]),
         claim("data_regions", {"available": ["India"], "planned": []}, quote="Content is stored in India on Stratus Grid infrastructure.")])
     assert "data_regions" in {c.field for c in kept}
+
+
+def test_validate_submission_accepts_a_well_formed_file_and_names_every_defect():
+    ids = ["c1__SEC-4.2", "c1__OVERALL"]
+    assert kp.validate_submission(ids, [("c1__SEC-4.2", "PASS"), ("c1__OVERALL", "BLOCKED")]) == []
+    assert any("duplicate" in p for p in kp.validate_submission(ids, [("c1__SEC-4.2", "PASS"), ("c1__SEC-4.2", "PASS")]))
+    assert any("do not match" in p for p in kp.validate_submission(ids, [("c1__SEC-4.2", "PASS"), ("c2__OVERALL", "BLOCKED")]))
+    assert any("expected 2" in p for p in kp.validate_submission(ids, [("c1__SEC-4.2", "PASS")]))
+    assert any("not one of" in p for p in kp.validate_submission(ids, [("c1__SEC-4.2", "BLOCKED"), ("c1__OVERALL", "BLOCKED")]))   # overall label on a requirement row
+    assert any("not one of" in p for p in kp.validate_submission(ids, [("c1__SEC-4.2", "PASS"), ("c1__OVERALL", "PASS")]))            # requirement label on an overall row
