@@ -94,6 +94,9 @@ Value shapes (use exactly these):
     scheme (ISO 27701, ISO 42001, SOC 3, PCI DSS, ...) write its name exactly as the page writes it; never map it onto one of those four.
     Only independent attestations count: SOC 2, ISO/IEC standards and similar named schemes. Penetration tests, vulnerability scans,
     security training, encryption, audit logs and bug bounties are practices, not certifications: do not return them.
+    List EVERY certification or attestation the page mentions, each as its own item, including vague or unaccepted ones: do not skip one
+    because another is listed. 'Maintains SOC 2 compliance' or 'SOC 2 compliant' is name 'SOC 2', status 'certified'; 'holds ISO 9001' is
+    name 'ISO 9001', status 'certified'.
     status: 'certified' only if the page says it has been achieved or is held; 'in_progress' if an audit or assessment is under way; 'planned' if intended.
     date: the date the report or certificate was issued; if the page gives only an audit period, the last day of that period; null if neither.
     valid_until: ONLY an expiry date the page prints for a certificate (expires / valid until). A SOC 2 report has no expiry: its audit
@@ -188,7 +191,27 @@ def normalise_page_claims(claims: list[Claim]) -> tuple[list[Claim], list[str]]:
             why.append(f"{c.field}: {reason}")
         else:
             kept.append(n)
-    return kept, why
+    kept, more = drop_subprocessor_derived_regions(kept)
+    return kept, why + more
+
+
+def drop_subprocessor_derived_regions(claims: list[Claim]) -> tuple[list[Claim], list[str]]:
+    """A region claim whose supporting quote names one of the page's own sub-processors, and whose regions are all that sub-processor's
+    country, says where a third party is based, not where the vendor stores customer content. The model is told not to derive regions
+    from sub-processor lines but does not always obey, so the rule is enforced here (no phrasing is matched: only the model's own quote
+    against the model's own sub-processor claims)."""
+    subs = [sp for c in claims if c.field == "subprocessors" for sp in c.value]
+    kept, notes = [], []
+    for c in claims:
+        if c.field == "data_regions":
+            q = f" {norm_entity(c.quote)} "
+            named = [sp for sp in subs if norm_entity(sp.get("name")) and f" {norm_entity(sp['name'])} " in q]
+            claimed = {norm_entity(r) for r in c.value.get("available", []) + c.value.get("planned", [])}
+            if named and claimed and claimed <= {norm_entity(sp.get("country")) for sp in named}:
+                notes.append(f"data_regions: dropped, the quote is the sub-processor line for {named[0]['name']} ({named[0].get('country')})")
+                continue
+        kept.append(c)
+    return kept, notes
 
 
 @dataclass
@@ -244,9 +267,18 @@ def _newest(cands: list[tuple[str, str, Any]]):
     return (group[0], False) if all(repr(v) == first for v in group) else (None, True)
 
 
-def _merge_certs(items: list[PageClaims]) -> Optional[dict]:
+def _merge_certs(items: list[PageClaims], strategy: str = "newest_page") -> Optional[dict]:
     """Per certificate name the newest statement decides the status; issuer/date/valid_until come from the newest entry of that
-    name and status that has them (the vendor's page says 'certified', the registry entry carries the dates)."""
+    name and status that has them (the vendor's page says 'certified', the registry entry carries the dates).
+
+    strategy 'newest_page' (default): policy rule 2 says the newer OFFICIAL page wins when two pages disagree, so the official pages
+    that state certifications are reduced to the newest date: an older "SOC 2 compliant" does not survive next to a newer "SOC 2 Type II
+    audit in progress". Registry entries held by the vendor's own entity are independent sources and always take part.
+    strategy 'union_by_name': every official page takes part; only the same certificate name is superseded."""
+    if strategy == "newest_page":
+        with_certs = [pc for pc in items if pc.role == "official" and any(c.field == "security_certifications" for c in pc.claims)]
+        top = max((pc.date for pc in with_certs), default=None)
+        items = [pc for pc in items if pc.role != "official" or pc.date == top or not any(c.field == "security_certifications" for c in pc.claims)]
     by_name: dict[str, list[tuple[str, str, dict]]] = {}
     for pc in items:
         for c in pc.claims:
@@ -298,7 +330,7 @@ def _merge_incidents(items: list[PageClaims], as_of: date, lookback_days: int = 
     return {"value": sorted(by_date.values(), key=lambda i: i["date"], reverse=True)}, notes
 
 
-def build_facts(items: list[PageClaims], as_of: date, *, subprocessors: str = "newest_page") -> Merged:
+def build_facts(items: list[PageClaims], as_of: date, *, subprocessors: str = "newest_page", certs: str = "newest_page") -> Merged:
     """Official + registry pages -> the `facts` dict rules_lite expects. Newest `last_updated` wins; same-date disagreement
     leaves the field out (UNKNOWN) instead of picking one."""
     m = Merged()
@@ -330,10 +362,10 @@ def build_facts(items: list[PageClaims], as_of: date, *, subprocessors: str = "n
     def cands(fld: str):
         return [(pc.date, pc.page_id, v) for pc in items if (v := page_value(pc, fld)) is not None]
 
-    certs = _merge_certs(items)
-    if certs:
-        certs["evidence_level"] = "documented" if is_documented(certs["value"]) else "claimed"
-        m.facts["security_certifications"] = certs
+    merged_certs = _merge_certs(items, certs)
+    if merged_certs:
+        merged_certs["evidence_level"] = "documented" if is_documented(merged_certs["value"]) else "claimed"
+        m.facts["security_certifications"] = merged_certs
 
     for fld in ENUM_FIELDS:
         v, tie = _newest(cands(fld))
@@ -362,14 +394,11 @@ def build_facts(items: list[PageClaims], as_of: date, *, subprocessors: str = "n
         elif v is not None:
             m.facts["subprocessors"] = {"value": v}
 
-    ret: dict[str, Optional[int]] = {}
-    for sub in ("default_days", "deletion_on_request_days"):
-        v, tie = _newest([(d, p, val[sub]) for d, p, val in cands("data_retention") if val.get(sub) is not None])
-        if tie:
-            m.conflicts.append(f"data_retention.{sub}: same-date pages disagree")
-        ret[sub] = v
-    if any(x is not None for x in ret.values()):
-        m.facts["data_retention"] = {"value": ret}
+    v, tie = _newest(cands("data_retention"))       # one page's statement of the field as a unit, like every other field
+    if tie:
+        m.conflicts.append("data_retention: same-date pages disagree")
+    elif v is not None:
+        m.facts["data_retention"] = {"value": v}
 
     inc, notes = _merge_incidents(items, as_of)
     m.notes += notes

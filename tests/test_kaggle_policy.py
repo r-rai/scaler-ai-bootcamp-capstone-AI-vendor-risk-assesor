@@ -165,10 +165,11 @@ def test_pages_dated_after_the_as_of_date_are_ignored():
     assert m.facts["sso_saml"]["value"] == "all_plans"
 
 
-def test_retention_subfields_merge_independently_newest_first():
-    m = kp.build_facts([pc("a", "official", "2025-01-01", claim("data_retention", {"default_days": 90, "deletion_on_request_days": 30})),
-                        pc("b", "official", "2026-01-01", claim("data_retention", {"default_days": 7, "deletion_on_request_days": None}))], AS_OF)
-    assert m.facts["data_retention"]["value"] == {"default_days": 7, "deletion_on_request_days": 30}
+def test_retention_is_one_pages_statement_not_a_blend_of_two():
+    # A fact no page states (old default_days + new deletion_on_request_days) must never be assembled.
+    m = kp.build_facts([pc("a", "official", "2025-01-01", claim("data_retention", {"default_days": 14, "deletion_on_request_days": 30})),
+                        pc("b", "official", "2026-01-01", claim("data_retention", {"default_days": None, "deletion_on_request_days": 14}))], AS_OF)
+    assert m.facts["data_retention"]["value"] == {"default_days": None, "deletion_on_request_days": 14}
 
 
 def test_certificate_dates_from_the_registry_make_the_vendors_claim_documented():
@@ -260,3 +261,51 @@ def test_a_bare_object_for_a_list_field_is_wrapped_not_rejected():
     kept, why = kp.normalise_page_claims([claim("subprocessors", {"name": "HostCo", "purpose": "hosting", "category": "hosting", "country": "Canada"}),
                                           claim("security_incidents", {"date": "2026-03-02", "summary": "x", "severity": "major", "postmortem_published": False})])
     assert len(kept) == 2 and not why and isinstance(kept[0].value, list)
+
+
+def _certs(*pcs, strategy="newest_page"):
+    return kp.build_facts(list(pcs), AS_OF, certs=strategy).facts.get("security_certifications")
+
+
+def test_a_newer_specific_cert_statement_replaces_an_older_vague_one_of_a_different_name():
+    old = pc("old", "official", "2024-08-01", claim("security_certifications", [cert(name="SOC 2", status="certified")]))
+    new = pc("new", "official", "2026-06-01", claim("security_certifications", [cert(name="SOC 2 Type II", status="in_progress")]))
+    assert [c["name"] for c in _certs(old, new)["value"]] == ["SOC 2 Type II"]
+    assert {c["name"] for c in _certs(old, new, strategy="union_by_name")["value"]} == {"SOC 2", "SOC 2 Type II"}
+
+
+def test_an_older_page_still_speaks_about_certificates_when_newer_pages_are_silent_about_them():
+    old = pc("old", "official", "2024-08-01", claim("security_certifications", [cert(name="SOC 2 Type II", status="certified", date="2026-01-20", issuer="Aud")]))
+    new = pc("new", "official", "2026-06-01", claim("sso_saml", "all_plans"))
+    assert [c["name"] for c in _certs(old, new)["value"]] == ["SOC 2 Type II"]
+
+
+def test_own_entity_registry_entries_take_part_next_to_the_newest_official_page():
+    off = pc("o", "official", "2026-06-01", claim("security_certifications", [cert(name="ISO 27001", status="certified")]))
+    reg = pc("r", "registry", "2026-02-01", claim("security_certifications", [cert(name="ISO 27001", status="certified", holder="Acme Ltd", date="2025-09-27", issuer="Certisa")]))
+    assert _certs(off, reg)["evidence_level"] == "documented"
+
+
+def _sp(name, country):
+    return {"name": name, "purpose": "Cloud hosting and storage", "category": "hosting", "country": country}
+
+
+def test_a_region_taken_from_a_sub_processor_line_is_dropped():
+    kept, why = kp.normalise_page_claims([
+        claim("subprocessors", [_sp("Stratus Grid", "Canada")]),
+        claim("data_regions", {"available": ["Canada"], "planned": []}, quote="We use Stratus Grid (Canada) for Cloud hosting and storage.")])
+    assert [c.field for c in kept] == ["subprocessors"] and any("sub-processor line" in w for w in why)
+
+
+def test_a_genuine_storage_statement_survives_next_to_a_sub_processor_list():
+    kept, _ = kp.normalise_page_claims([
+        claim("subprocessors", [_sp("Stratus Grid", "Canada")]),
+        claim("data_regions", {"available": ["India"], "planned": []}, quote="Customer content is stored at rest in India.")])
+    assert {c.field for c in kept} == {"subprocessors", "data_regions"}
+
+
+def test_a_region_that_differs_from_the_named_sub_processors_country_is_kept():
+    kept, _ = kp.normalise_page_claims([
+        claim("subprocessors", [_sp("Stratus Grid", "Canada")]),
+        claim("data_regions", {"available": ["India"], "planned": []}, quote="Content is stored in India on Stratus Grid infrastructure.")])
+    assert "data_regions" in {c.field for c in kept}

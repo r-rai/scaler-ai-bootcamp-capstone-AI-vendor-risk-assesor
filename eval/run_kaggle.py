@@ -162,6 +162,7 @@ def main() -> int:
     ap.add_argument("--max-usd", type=float, default=1.0, help="hard cap for LLM spend in THIS run")
     ap.add_argument("--cache-only", action="store_true", help="never call the LLM; pages not in the cache are reported as not extracted")
     ap.add_argument("--subprocessors", choices=["newest_page", "union"], default="newest_page")
+    ap.add_argument("--certs", choices=["newest_page", "union_by_name"], default="newest_page")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -241,7 +242,7 @@ def main() -> int:
             pc = kp.PageClaims(r["page"]["page_id"], r["role"], kp.page_date(r["page"]), claims)
             notes += kp.check_holders(pc, case["legal_entity"])
             items.append(pc)
-        merged = kp.build_facts(items, as_of, subprocessors=a.subprocessors)
+        merged = kp.build_facts(items, as_of, subprocessors=a.subprocessors, certs=a.certs)
         facts = strip_internal(merged.facts)
         v = rl.evaluate(facts, reqs, case["tier"], int(case["users"]), as_of)
         ov = rl.overall(v, reqs)

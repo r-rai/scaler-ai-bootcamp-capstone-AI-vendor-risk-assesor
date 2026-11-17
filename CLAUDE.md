@@ -16,6 +16,7 @@ python run_assessor.py "<question>" --tier T3 --users 35 [--groups public,employ
 python -m pytest -q                           # full suite (also: python scripts/run_all_tests.py)
 python -m pytest tests/test_matcher.py::test_name -q   # single test
 python eval/run_eval.py --strict --real --ablations    # scorecard; writes reports/eval_report.md (CI runs this)
+python eval/run_kaggle.py --split train --subset dev [--limit N] [--cache-only]   # offline Kaggle runner (data in gitignored data_kaggle/; real LLM from .env, so do NOT export LLM_PROVIDER=mock; costs money unless --cache-only)
 python scripts/cache_admin.py stats|purge ...  # caches (audited purges); scripts/retention.py [--apply]; scripts/verify_audit.py
 make help                                     # Makefile shortcuts (test, test-builtin, eval, lint, models, docker targets - docker unverified)
 uvicorn app.api:app --reload --port 8000      # FastAPI backend
