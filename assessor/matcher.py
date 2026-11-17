@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 import yaml
 
+from .claims import is_absence_statement
 from .config import REQUIREMENTS_FILE
 from .errors import record_error
 from .policy_rag import PolicyLibrary
@@ -143,6 +144,14 @@ def rule_enum_verdict(req: Requirement, fact: Optional[VendorFact], ctx: dict) -
         return "UNKNOWN", "Not stated in the vendor's public material."
     v = str(fact.value)
     p = req.params
+    if v in p.get("fail", []) and is_absence_statement(fact.display):
+        # "No SSO mentioned on the page" describes the page, not the vendor. Absence is not evidence (UNKNOWN beats a guess).
+        return "UNKNOWN", f"The source only does not mention it ({fact.display}). Absence of a mention is not evidence; ask the vendor."
+    decisive = p.get("decisive_levels")
+    if decisive and fact.evidence_level not in decisive and (v in p.get("pass", []) or v in p.get("fail", [])):
+        # Who said it matters for a blocker: a forum post, review or third-party write-up may not decide PASS or FAIL.
+        return "NEEDS_REVIEW", (f"{fact.display}. Only {fact.evidence_level} evidence (a decision here needs "
+                                f"{' or '.join(decisive)}); confirm with the vendor's own terms.")
     if v in p.get("pass", []):
         return "PASS", fact.display
     if v in p.get("review", []):
@@ -152,14 +161,33 @@ def rule_enum_verdict(req: Requirement, fact: Optional[VendorFact], ctx: dict) -
     return "UNKNOWN", f"Unrecognised value {v!r}; check the extraction."
 
 
+# A sub-processor that runs or serves a language model is a model provider whatever category the extractor gave it
+# ("hosting" for Baseten serving LLMs). Tight on purpose: bare "AI" would flag every vendor.
+_MODEL_PROVIDER_PURPOSE = re.compile(
+    r"\b(?:large language models?|language models?|llms?|foundation models?|generative ai|model (?:hosting|serving|inference)|"
+    r"(?:hosting|serving|running) (?:of )?(?:ai |ml |machine learning )?models?)\b", re.I)
+_MODEL_PROVIDER_NAME = re.compile(
+    r"\b(?:openai|anthropic|cohere|mistral|gemini|vertex ai|bedrock|hugging ?face|baseten|fireworks|together ai|groq|replicate)\b", re.I)
+
+
+def _is_model_provider(item: dict) -> bool:
+    if item.get("category") == "model_provider":
+        return True
+    return bool(_MODEL_PROVIDER_PURPOSE.search(str(item.get("purpose", ""))) or _MODEL_PROVIDER_NAME.search(str(item.get("name", ""))))
+
+
 def rule_list_disclosed(req: Requirement, fact: Optional[VendorFact], ctx: dict) -> tuple[Verdict, str]:
     if fact is None or not fact.value:
         return "UNKNOWN", "No sub-processor list could be found. Ask the vendor for it."
     flag_cats = set(req.params.get("review_if_category", []))
-    flagged = [i for i in fact.value if i.get("category") in flag_cats]
+    flagged = [i for i in fact.value if i.get("category") in flag_cats or _is_model_provider(i)]
     if flagged:
         names = ", ".join(f"{i['name']} ({i.get('country', '?')})" for i in flagged)
         return "NEEDS_REVIEW", f"{len(fact.value)} sub-processors disclosed. Model provider(s) present: {names} — confirm AI-2.1 applies to them too."
+    if req.params.get("require_documented", False) and fact.evidence_level != "documented":
+        # A list quoted from an FAQ, trust summary or marketing page may be one product's subset, not the published list.
+        return "NEEDS_REVIEW", (f"{len(fact.value)} sub-processor(s) found, but only as a {fact.evidence_level} statement, not on the "
+                                "vendor's published sub-processor list. Confirm the list is complete.")
     return "PASS", f"{len(fact.value)} sub-processors disclosed; no third-party model provider."
 
 

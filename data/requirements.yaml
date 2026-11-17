@@ -76,6 +76,7 @@ requirements:
       pass:   ["no"]                                   # never trains on customer content
       review: ["no_on_paid_plans", "opt_out_available"] # fine only on a plan where it is contractually off
       fail:   ["yes"]
+      decisive_levels: ["documented", "claimed"]       # a forum, review or third-party write-up cannot decide a blocker
     severity: blocker
     applies_when: { tiers: ["T2", "T3"] }
 
@@ -87,6 +88,7 @@ requirements:
     rule: list_disclosed
     params:
       review_if_category: ["model_provider"]  # a third-party model provider needs its own AI-2.1 check
+      require_documented: true                # a list quoted from an FAQ or marketing page may be a subset
     severity: major
     applies_when: { tiers: ["T2", "T3"] }
 

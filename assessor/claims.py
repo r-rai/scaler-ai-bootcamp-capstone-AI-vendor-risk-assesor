@@ -30,12 +30,31 @@ ENUMS: dict[str, set[str]] = {
     "sso_saml": {"all_plans", "paid_plans", "enterprise_only", "none"},
     "dpa_available": {"yes", "on_request", "no"},
 }
+# The enum value that means "the vendor does not offer this". Only an explicit statement may produce it.
+NEGATIVE_VALUES = {"sso_saml": "none", "dpa_available": "no"}
 SEVERITY_MAP = {"major": "major", "critical": "major", "high": "major", "severe": "major",
                 "minor": "minor", "low": "minor", "medium": "minor", "availability": "minor"}
 
 
 class Malformed(ValueError):
     pass
+
+
+# "No SSO mentioned on the page" says what the PAGE lacks, not what the VENDOR lacks. Treating it as a negative
+# fact is a guess. Matched on the claim's own words so the same test works at extraction time (normalise_claim)
+# and at verdict time (matcher.rule_enum_verdict, which also runs on saved profiles). It must not catch real
+# negatives such as "does not support SSO" or "SSO is not available".
+_ABSENCE = re.compile(
+    r"\b(?:no|not|without|nothing|never)\b[^.;]{0,40}?\b(?:mention(?:s|ed|ing)?|stated?|specif(?:y|ied)|listed?|"
+    r"disclos(?:e|ed|es)|document(?:ed|ation)?|found|described?|reference[sd]?|indicat(?:e|ed))\b"
+    r"|\bno (?:information|details?|data|evidence|indication)\b"
+    r"|\bunable to (?:find|confirm|verify)\b|\bcould(?: not|n't) (?:be )?(?:find|found|confirm(?:ed)?|verif(?:y|ied))\b"
+    r"|\bdoes(?:n't| not) (?:say|state|mention|specify|list|disclose)\b", re.I)
+
+
+def is_absence_statement(text: Any) -> bool:
+    """True when `text` reports that something was not found or not mentioned, rather than that it does not exist."""
+    return bool(_ABSENCE.search(str(text or "")))
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -185,4 +204,6 @@ def normalise_claim(claim: Claim) -> tuple[Optional[Claim], str]:
         return None, f"unreadable value ({type(exc).__name__})"
     claim.display = _text(claim.display, 300) or _text(claim.value, 300)
     claim.quote = _text(claim.quote, 600)
+    if claim.field in NEGATIVE_VALUES and claim.value == NEGATIVE_VALUES[claim.field] and is_absence_statement(claim.display):
+        return None, "absence of a mention is not evidence that the vendor lacks it (UNKNOWN beats a guess)"
     return claim, ""

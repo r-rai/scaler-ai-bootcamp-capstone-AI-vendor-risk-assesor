@@ -194,6 +194,10 @@ SOURCE_TYPES = _load_source_types()
 def guess_source_type(url: str, official_domain: Optional[str]) -> str:
     host = re.sub(r"^https?://", "", url).split("/")[0].split(":")[0].lower()
     if official_domain and (host == official_domain.lower() or host.endswith("." + official_domain.lower())):
+        # A vendor-hosted forum (community.openai.com) is user-generated content, not the vendor speaking: SEC-9.4.
+        prefix = host[: -len(official_domain)].strip(".").split(".") if host != official_domain.lower() else []
+        if any(k in label for label in prefix for k in SOURCE_TYPES.get("forum", [])):
+            return "forum"
         return "official"
     for kind in _TYPE_ORDER:
         if any(k in host for k in SOURCE_TYPES.get(kind, [])):
