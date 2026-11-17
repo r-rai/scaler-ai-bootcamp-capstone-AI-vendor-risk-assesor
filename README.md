@@ -177,9 +177,33 @@ So, for this vendor on this network: **three of three runs at `69df346` finished
 7 or 8 of 9 fields**, against one of the two before it. Three runs is a small sample, and none of them reached the 30 s cap
 (slowest extract call 26.6 s) or used the parameter fallback, so they show MiniMax was not stalling that time, not that the cap
 worked; the unit tests are what show that. All five runs ended BLOCKED on DP-3.1
-(customer data stored in India), the same verdict from the same facts; the requirements left UNKNOWN varied between one and two.
-DuckDuckGo from this network still fails some queries (1 to 7 per run) and no Tavily key is configured, so
-`SEARCH_PROVIDER=tavily` is untested. No live accuracy figure against `data/gold_set_real.json` has been measured.
+(customer data stored in India). **That verdict was a matcher bug, not the vendor:** the extractor returned the region as `IN`
+and the matcher compared exact strings against `India` (fixed in `f39df3e`; the five runs above are the pre-fix behaviour).
+DuckDuckGo from this network fails some queries (1 to 7 per run). The earlier statement that Tavily was "untested" understated
+it: it could not run at all, because `tavily-python` was not installed in the venv and the ddgs fallback hid that. It is
+declared in `requirements-prod.txt`; install that file to use `SEARCH_PROVIDER=tavily`.
+
+**Live accuracy against `data/gold_set_real.json` (2026-11-17; MiniMax main and Flash extract, Tavily search, caches off, gold
+checked on 2026-11-01).** Harness: `SEARCH_PROVIDER=tavily VRA_CACHE=0 python eval/run_live_real.py` (one vendor at a time,
+per-run and batch cost caps, search provider asserted from the trace, profiles saved so `--rescore DIR` re-runs the matcher
+for free; `--dry` checks the scoring offline). The gold set stores expected *verdicts*, so "field accuracy" here is
+per-requirement verdict accuracy over the 8 web-driven requirements (PROC-1.1 comes from the internal Approved Vendor List,
+10/10, and is excluded).
+
+| | Correct / 80 | Guesses | Overall verdict | Cost | Wall time |
+|---|---|---|---|---|---|
+| Baseline, 10 vendors, one run each | 32 (40%) | 4 | 4 of 10 | $0.10 | 46 to 80 s (deadline never hit) |
+| Same saved profiles, matcher after `f39df3e` | 34 (42.5%) | 4 | 6 of 10 | $0 (rescored) | n/a |
+
+**This is below the 80% gate, so extraction stays on MiniMax Flash and must not move to the local model.** Most misses are
+conservative (22 UNKNOWN because nothing was found, 17 NEEDS_REVIEW), not wrong values. By requirement (baseline): SEC-4.2
+1/10, SEC-9.3 2/10, SEC-7.1 4/10, DP-3.1 4/10 (6/10 after the fix), AI-3.4 4/10, DP-2.2 5/10, DP-5.4 5/10, AI-2.1 7/10.
+Known causes: official pages such as `zoho.com/trust` are extracted as `claimed` with confidence near 0.24, so SEC-4.2
+(documented and dated) asks for review; India regions for Freshworks and LiveKit were never found. The four guesses (a verdict
+of PASS or FAIL where the gold set says NEEDS_REVIEW) are the most important finding: AI-3.4 for Freshworks and Notion (a partial
+sub-processor list passes), AI-2.1 for OpenAI (PASS resting on a third-party claim of confidence 0.02) and SEC-7.1 for Ringg
+(FAIL because the page does not mention SSO). Limits: one run per vendor; live runs are non-deterministic; the web has moved
+since 2026-11-01 (Lorikeet DP-5.4 may be drift: the vendor states 60 days, the gold set says PASS). The gold set was not edited.
 
 **Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
 (Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**. Docker Desktop is now

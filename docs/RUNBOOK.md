@@ -106,6 +106,7 @@ setting them.
 | Tests or `/ready` hang at start | Models are missing and a download is stalling. The loader now gives up after `VRA_MODEL_LOAD_TIMEOUT_S` and uses the builtin backend; fix properly with `HF_HUB_DISABLE_XET=1 scripts/setup_models.sh`. |
 | Models re-download after every WSL restart | They were in `/tmp`. The cache is now `~/.cache/fastembed`; check `FASTEMBED_CACHE_PATH`. |
 | Live run over 90 s, few facts | Check `runs/<run>/trace.jsonl` for `search_failed` and `fetch_failed`, and look for another transfer using the network. Try `SEARCH_PROVIDER=tavily` with a key. The run stops at `VRA_MAX_SECONDS` and reports what it has. |
+| Every search says `provider: ddgs` although `SEARCH_PROVIDER=tavily` | `tavily-python` is not installed (it is in `requirements-prod.txt`, not `requirements.txt`) and the fallback hides it: the `search_failed` error text says "pip install tavily-python". Install it. `python eval/run_live_real.py` reports `provider_check=CONTAMINATED` in this case. |
 | Many `search_failed` with ddgs | DuckDuckGo is rate-limiting or slow from this network. Use Tavily; the other provider is tried automatically if both are configured. |
 | `fetch_failed ... pypdf is not installed` | `uv pip install pypdf` (it is in `requirements-prod.txt`). |
 | Local model errors, then slower runs | `llama-server` is down or out of GPU memory. `LLM_FALLBACK=1` sends small-role calls to the cloud small model; restart the server (`LLAMA_CTX=4096 scripts/serve_local_llm.sh` if memory is tight). |
