@@ -77,7 +77,8 @@ class Settings:
 
     # --- Search --------------------------------------------------------------
     search_provider: str = field(default_factory=lambda: _env("SEARCH_PROVIDER", "offline").lower())
-    tavily_api_key: str = field(default_factory=lambda: _env("TAVILY_API_KEY", ""))
+    # repr=False: printing SETTINGS must never reveal a secret (tests/test_config_secrets.py)
+    tavily_api_key: str = field(default_factory=lambda: _env("TAVILY_API_KEY", ""), repr=False)
     results_per_query: int = field(default_factory=lambda: _env_int("VRA_RESULTS_PER_QUERY", 5))
 
     # --- Embeddings & Reranker (free local models or built-in fallback) -------
