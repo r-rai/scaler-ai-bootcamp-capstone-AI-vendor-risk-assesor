@@ -171,9 +171,12 @@ services:
   grafana:
     profiles: ["obs"]
     image: ${GRAFANA_IMAGE:-grafana/grafana:11.4.0}
+    # Fail closed at START, not at load: compose interpolates the whole file, so a `:?` on the variable would make
+    # `docker compose up api` fail too. An empty password would fall back to Grafana's built-in admin/admin.
+    entrypoint: ["/bin/sh", "-c", "[ -n \"$$GF_SECURITY_ADMIN_PASSWORD\" ] || { echo 'set GRAFANA_PASSWORD in .env before starting the obs profile' >&2; exit 1; }; exec /run.sh"]
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env before starting the obs profile}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"

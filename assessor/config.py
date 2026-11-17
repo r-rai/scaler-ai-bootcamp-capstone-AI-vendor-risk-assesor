@@ -67,6 +67,8 @@ class Settings:
     llm_extract_provider: str = field(default_factory=lambda: _env("LLM_EXTRACT_PROVIDER", "").lower())
     llm_fallback: bool = field(default_factory=lambda: _env("LLM_FALLBACK", "1") == "1")
     llm_timeout_s: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT_S", 60.0))
+    # The high-volume roles (small, extract) normally answer in 2-15 s; a call past this is a stall, not work.
+    llm_small_timeout_s: float = field(default_factory=lambda: _env_float("LLM_SMALL_TIMEOUT_S", 30.0))
     # Reasoning effort for providers with adaptive thinking (verified on MiniMax). The high-volume roles
     # (small, extract) classify and copy facts; "low" cut their latency and output tokens by more than half
     # with the same answers. Blank = provider default.

@@ -199,14 +199,38 @@ class LLM:
         elif json_mode and cfg["provider"] != "ollama":
             kwargs["response_format"] = {"type": "json_object"}
         client = _client(cfg)
+        timeout, retries = self._call_limits(cfg)
+        if (timeout, retries) != (SETTINGS.llm_timeout_s, 0 if cfg.get("local") else 2):
+            client = client.with_options(timeout=timeout, max_retries=retries)
         try:
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 — some providers reject an optional parameter; retry once without them
-            if "response_format" not in kwargs and "reasoning_effort" not in kwargs:
+        except Exception as exc:  # noqa: BLE001
+            # Only a provider that REJECTS an optional parameter (HTTP 400/422) gets the bare retry. A timeout, a
+            # dropped connection, a 429 or a 5xx must not: the SDK has already retried those, and a second call
+            # without `reasoning_effort` lets a thinking model reason without limit (measured: 6 s -> 48 s).
+            if getattr(exc, "status_code", None) not in (400, 422) or (
+                    "response_format" not in kwargs and "reasoning_effort" not in kwargs):
                 raise
+            self._trace("llm_param_fallback", provider=cfg["provider"], error=str(exc)[:160],
+                        dropped=[k for k in ("response_format", "reasoning_effort") if k in kwargs])
             kwargs.pop("response_format", None)
             kwargs.pop("reasoning_effort", None)
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+
+    def _call_limits(self, cfg: dict) -> tuple[float, int]:
+        """HTTP timeout and SDK retries for ONE call: bounded by the role's cap and by the time the run has left,
+        so a stalled provider can never hold a worker thread past the deadline."""
+        timeout = SETTINGS.llm_timeout_s
+        if self.role in ("small", "extract"):
+            timeout = min(timeout, SETTINGS.llm_small_timeout_s)
+        retries = 0 if cfg.get("local") else 2
+        b = self.budget
+        if getattr(b, "max_seconds", 0):
+            left = b.max_seconds - b.elapsed_s
+            timeout = min(timeout, max(3.0, left - 1.0))
+            while retries and (retries + 1) * timeout > max(left, 0):
+                retries -= 1
+        return timeout, retries
 
     def _complete(self, messages: list[dict], *, stage: str, **kw):
         """Try each target in order, skipping providers whose circuit breaker is open."""
