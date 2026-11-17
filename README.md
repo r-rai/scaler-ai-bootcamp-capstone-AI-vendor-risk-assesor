@@ -145,7 +145,7 @@ used if that stalls, so a bad network cannot hang startup or `/ready` (the faste
 sentence-transformers fallback, not installed here, has no such deadline). If large downloads stall at 0 bytes, set
 `HF_HUB_DISABLE_XET=1` (what `setup_models.sh` does by default).
 
-**Measured live run** (Zoho Desk Zia, T3, 35 users; MiniMax main and extract, local Qwen for the small roles, ddgs search,
+**Measured live run** (Zoho Desk Zia, T3, 35 users; MiniMax for every role in the rows from `8dc4304` on (no local model running), ddgs search,
 caches off, 2026-11-17, nothing else using the network). The 90 s limit applies to the run itself; the CLI adds a cold start
 (about 9 s with caches off because the policy corpus is re-embedded, about 1 s with the default caches).
 
@@ -155,17 +155,34 @@ caches off, 2026-11-17, nothing else using the network). The 90 s limit applies 
 | `1161a20` | builtin | 73 s | 73 s | 8 / 9 | 6 | 4 of 9 |
 | `a2a4682` | fastembed | 68 s | 56 s | 3 / 4 | 2 | 16 of 17 |
 | `a2a4682` | fastembed | 97 s | 87 s | 5 / 6 | 8 | 13 of 16 |
+| `8dc4304` | fastembed | 75 s | 65 s | 19 read | 7 | 7 of 18 |
+| `8dc4304` | fastembed | 97 s | 88 s | 16 read | 7 | 2 of 9 |
+| `69df346` | fastembed | 52 s | 42 s | 23 read | 8 | 2 of 16 |
+| `69df346` | fastembed | 75 s | 66 s | 24 read | 8 | 3 of 18 |
+| `69df346` | fastembed | 56 s | 47 s | 24 read | 7 | 1 of 16 |
 
-So the "under 90 s with real facts" target is **not reliably met**: three of four runs finished under 90 s wall-clock, but the
-fastest one found only 2 of 9 fields because almost every search timed out, and the one with 8 of 9 fields took 97 s wall-clock.
-Whenever search worked, the run stopped on the time limit with pages still unread. The overall outcome also varied (BLOCKED or
-CONDITIONAL) because the web returned different pages; for the same facts the matcher always gives the same verdicts.
-DuckDuckGo from this network fails most queries; Tavily (`SEARCH_PROVIDER=tavily`) would likely help but no key is configured, so
-that is untested. No live accuracy figure against `data/gold_set_real.json` has been measured.
+(Rows from `8dc4304` on count pages read and fields filled from `profile.json`; the earlier rows counted extracted / seen
+pages, so the columns are not exactly comparable.)
+
+**What the two `8dc4304` rows showed.** Not search: in both runs one extraction call (the 20,000-character
+`zoho.com/security` page) took 45 s and 82 s while every other call took 2 to 16 s, so a single call held the first pass open
+until the deadline. Reproduced in isolation: the same 3.3k-token page took 6 s with `reasoning_effort=low` and 48 s without it
+(4,743 hidden reasoning tokens against 519). `LLM._create` used to retry any failure, timeouts included, without
+`reasoning_effort`, so one stalled call became an unbounded-thinking call. At `69df346` only an HTTP 400/422 gets that retry,
+small and extract calls are capped at `LLM_SMALL_TIMEOUT_S` (30 s), and every call's timeout and retries are bounded by the time
+the run has left.
+
+So, for this vendor on this network: **three of three runs after the fix finished under 90 s wall-clock (52, 75 and 56 s) with
+7 or 8 of 9 fields**, against one of the two before it. Three runs is a small sample. All five runs ended BLOCKED on DP-3.1
+(customer data stored in India), the same verdict from the same facts; the requirements left UNKNOWN varied between one and two.
+DuckDuckGo from this network still fails some queries (1 to 7 per run) and no Tavily key is configured, so
+`SEARCH_PROVIDER=tavily` is untested. No live accuracy figure against `data/gold_set_real.json` has been measured.
 
 **Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
-(Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**: Docker is not
-installed on the development machine. Treat them as untested until `docker compose --profile obs up` has been run.
+(Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**. Docker Desktop is now
+installed, and `docker compose config` accepts every profile (checked through the Windows `docker.exe`), but that only proves the
+file parses. Docker Desktop's WSL integration is not enabled for this Ubuntu distro, so `docker` does not work from inside it yet.
+Treat the stack as untested until `make up` and `make up-obs` have run through it, and the `fetcher` sandbox checks have passed.
 
 **Checks.** `LLM_PROVIDER=mock SEARCH_PROVIDER=offline python -m pytest -q`, also with `EMBEDDER=builtin RERANKER=builtin`,
 then `python eval/run_eval.py --strict --real --ablations`.
