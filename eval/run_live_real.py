@@ -75,6 +75,54 @@ def fact_snapshot(profile, field: str) -> dict | None:
             "conflicts": f.conflicts[:3], "unresolved_conflict": f.unresolved_conflict}
 
 
+def score_requirements(case: dict, results: list, profile, fields: dict[str, str], deadline_hit: bool) -> dict:
+    got = {r.requirement_id: r for r in results}
+    out = {}
+    for rid, exp in case["expected_verdicts"].items():
+        r = got.get(rid)
+        verdict = r.verdict if r else None
+        field = fields.get(rid, "?")
+        out[rid] = {
+            "field": field, "expected": exp, "got": verdict, "web_driven": field not in NON_WEB_FIELDS,
+            "category": classify(exp, verdict, deadline_hit=deadline_hit),
+            "reason": (r.reason[:200] if r else None), "fact": fact_snapshot(profile, field)}
+    return out
+
+
+def rescore(src: Path, out_dir: Path) -> int:
+    """Free: re-run ONLY the deterministic matcher over the profiles a live run saved (no LLM, no search)."""
+    from assessor.matcher import Matcher
+    from assessor.policy_rag import PolicyLibrary
+    from assessor.schemas import AssessmentRequest, VendorProfile
+
+    saved = json.loads((src / "results.json").read_text(encoding="utf-8"))
+    gold = {c["id"]: c for c in json.loads(GOLD_SET_REAL.read_text(encoding="utf-8"))["cases"]}
+    matcher, fields, rows = Matcher(PolicyLibrary()), requirement_fields(), []
+    for old in saved["rows"]:
+        case = gold[old["id"]]
+        pf_path = src / f"{case['id']}.profile.json"
+        row = {k: v for k, v in old.items() if k not in ("requirements", "got_overall")}
+        if not pf_path.exists():
+            row.update(requirements={}, got_overall=None)
+            rows.append(row)
+            continue
+        profile = VendorProfile.model_validate_json(pf_path.read_text(encoding="utf-8"))
+        req = AssessmentRequest(question=case["question"], vendor=case["vendor"], official_domain=profile.official_domain,
+                                tier=case["tier"], users=case["users"], user_groups=case["user_groups"])
+        results = matcher.evaluate(profile, req)
+        row["got_overall"] = matcher.overall(results)[0]
+        row["requirements"] = score_requirements(case, results, profile, fields, bool(old["deadline_hit"]))
+        rows.append(row)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summ = summarise(rows)
+    meta = dict(saved["meta"], stamp=f"rescore of {src.name}", dry=False, provider_check=saved["meta"]["provider_check"])
+    (out_dir / "results.json").write_text(json.dumps({"meta": meta, "summary": summ, "rows": rows}, indent=1, ensure_ascii=False), encoding="utf-8")
+    write_markdown(out_dir / "report.md", meta, rows, summ)
+    w = summ["web_driven"]
+    print(f"rescored {src.name}: web-driven {w['correct']}/{w['n']} guesses={summ['guesses']} -> {out_dir}/report.md")
+    return 0
+
+
 def run_case(case: dict, fields: dict[str, str], out_dir: Path) -> dict:
     budget = Budget()
     tracer = Tracer("livereal")
@@ -107,15 +155,7 @@ def run_case(case: dict, fields: dict[str, str], out_dir: Path) -> dict:
         return row
     (out_dir / f"{case['id']}.profile.json").write_text(
         json.dumps(rep.profile.model_dump(mode="json"), indent=1, ensure_ascii=False), encoding="utf-8")
-    got = {r.requirement_id: r for r in rep.results}
-    for rid, exp in case["expected_verdicts"].items():
-        r = got.get(rid)
-        verdict = r.verdict if r else None
-        field = fields.get(rid, "?")
-        row["requirements"][rid] = {
-            "field": field, "expected": exp, "got": verdict, "web_driven": field not in NON_WEB_FIELDS,
-            "category": classify(exp, verdict, deadline_hit=deadline_hit),
-            "reason": (r.reason[:200] if r else None), "fact": fact_snapshot(rep.profile, field)}
+    row["requirements"] = score_requirements(case, rep.results, rep.profile, fields, deadline_hit)
     return row
 
 
@@ -189,7 +229,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-batch-usd", type=float, default=3.0, help="Stop the batch when cumulative spend passes this")
     ap.add_argument("--dry", action="store_true", help="Mock/offline scoring validation: allowed only with LLM_PROVIDER=mock")
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--rescore", metavar="DIR", help="Free: re-run the matcher over a previous run's saved profiles")
     a = ap.parse_args(argv)
+
+    if a.rescore:
+        src = Path(a.rescore)
+        return rescore(src, Path(a.out_dir) if a.out_dir else src.with_name(src.name + "_rescored"))
 
     live = SETTINGS.llm_provider != "mock" or SETTINGS.search_provider != "offline"
     if a.dry and live:

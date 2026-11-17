@@ -16,6 +16,7 @@ Rules are declared in data/requirements.yaml; each `rule:` name maps to one func
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -92,16 +93,38 @@ def rule_certification_valid(req: Requirement, fact: Optional[VendorFact], ctx: 
     return "FAIL", f"No accepted certification found (saw: {names}). Accepted: {', '.join(req.params.get('accepted', []))}."
 
 
+# ISO 3166 codes the extractor may return instead of names ("IN" for India). Only used for whole-value codes.
+_ISO_REGION = {"in": "india", "us": "united states", "gb": "united kingdom", "uk": "united kingdom", "de": "germany",
+               "fr": "france", "ie": "ireland", "sg": "singapore", "au": "australia", "jp": "japan", "ca": "canada",
+               "cn": "china", "ae": "united arab emirates", "sa": "saudi arabia", "br": "brazil"}
+
+
+def _region_hit(wanted: str, value: str) -> bool:
+    """Does a stated storage region (any wording) satisfy a wanted region name?
+
+    Matches the exact name, the ISO code ("IN"), or the name as a whole word inside a longer description
+    ("India (AWS Mumbai, ap-south-1)"). Not a substring match, so "Indiana" is not India.
+    """
+    w, v = _norm(wanted), _norm(value)
+    if not w or not v:
+        return False
+    if v == w or _ISO_REGION.get(v) == w:
+        return True
+    return re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", v) is not None
+
+
 def rule_region_includes(req: Requirement, fact: Optional[VendorFact], ctx: dict) -> tuple[Verdict, str]:
     if fact is None or not isinstance(fact.value, dict):
         return "UNKNOWN", "Storage regions could not be established from public sources."
-    wanted = {_norm(x) for x in req.params.get("any_of", [])}
+    wanted = [_norm(x) for x in req.params.get("any_of", [])]
     available = {_norm(x) for x in fact.value.get("available", [])}
     planned = {_norm(x) for x in fact.value.get("planned", [])}
-    if wanted & available:
-        return "PASS", f"Customer content can be stored in {', '.join(sorted(wanted & available)).title()}. Regions: {fact.display}."
-    if wanted & planned and not req.params.get("allow_planned", False):
-        return "FAIL", f"{', '.join(sorted(wanted & planned)).title()} is only planned, which does not count. Available today: {', '.join(sorted(available)).title() or 'none stated'}."
+    hit = sorted({w for w in wanted if any(_region_hit(w, a) for a in available)})
+    if hit:
+        return "PASS", f"Customer content can be stored in {', '.join(hit).title()}. Regions: {fact.display}."
+    planned_hit = sorted({w for w in wanted if any(_region_hit(w, p) for p in planned)})
+    if planned_hit and not req.params.get("allow_planned", False):
+        return "FAIL", f"{', '.join(planned_hit).title()} is only planned, which does not count. Available today: {', '.join(sorted(available)).title() or 'none stated'}."
     if available:
         return "FAIL", f"Storage regions are {', '.join(sorted(available)).title()}; none of the required regions ({', '.join(req.params.get('any_of', []))})."
     return "UNKNOWN", "The vendor does not state where content is stored."
