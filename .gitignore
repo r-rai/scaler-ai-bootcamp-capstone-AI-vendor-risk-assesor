@@ -27,3 +27,6 @@ Thumbs.db
 # local caches and models
 runs/cache/
 models/
+
+# Kaggle competition data (rules ban sharing)
+data_kaggle/

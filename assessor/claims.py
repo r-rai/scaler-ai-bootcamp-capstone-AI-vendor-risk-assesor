@@ -97,8 +97,13 @@ def _certifications(value: Any) -> list[dict]:
         status = _text(item.get("status")).lower().replace(" ", "_").replace("-", "_")
         if status not in CERT_STATUSES:
             raise Malformed(f"certificate status {item.get('status')!r} is not one of {sorted(CERT_STATUSES)}")
-        out.append({"name": canonical_cert_name(str(item["name"])), "status": status, "date": _iso(item.get("date")),
-                    "valid_until": _iso(item.get("valid_until")), "issuer": _text(item.get("issuer"), 120) or None})
+        # `holder` is the entity the certificate was issued to, as the page words it. It is kept so a caller can refuse
+        # a certificate held by a same-name company; nothing here decides that.
+        entry = {"name": canonical_cert_name(str(item["name"])), "status": status, "date": _iso(item.get("date")),
+                 "valid_until": _iso(item.get("valid_until")), "issuer": _text(item.get("issuer"), 120) or None}
+        if _text(item.get("holder")):
+            entry["holder"] = _text(item.get("holder"), 160)   # only when the page names one, so older callers see the same shape
+        out.append(entry)
     if not out:
         raise Malformed("empty certificate list")
     return out
