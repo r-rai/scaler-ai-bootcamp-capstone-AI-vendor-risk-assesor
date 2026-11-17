@@ -166,14 +166,17 @@ pages, so the columns are not exactly comparable.)
 
 **What the two `8dc4304` rows showed.** Not search: in both runs one extraction call (the 20,000-character
 `zoho.com/security` page) took 45 s and 82 s while every other call took 2 to 16 s, so a single call held the first pass open
-until the deadline. Reproduced in isolation: the same 3.3k-token page took 6 s with `reasoning_effort=low` and 48 s without it
-(4,743 hidden reasoning tokens against 519). `LLM._create` used to retry any failure, timeouts included, without
-`reasoning_effort`, so one stalled call became an unbounded-thinking call. At `69df346` only an HTTP 400/422 gets that retry,
-small and extract calls are capped at `LLM_SMALL_TIMEOUT_S` (30 s), and every call's timeout and retries are bounded by the time
-the run has left.
+until the deadline. Those two calls reported only 1,001 and 760 output tokens, so the likeliest cause is plain provider latency
+plus the old 60 s timeout with two SDK retries (82 s fits a timeout and one retry); it was not proven. At `69df346` small and
+extract calls are capped at `LLM_SMALL_TIMEOUT_S` (30 s) and every call's timeout is bounded by the time the run has left (unit
+tested). The same commit fixes a separate latent bug found while reproducing: `LLM._create` retried any failure, timeouts
+included, without `reasoning_effort`, and without it the same 3.3k-token page took 48 s and 4,743 output tokens instead of 6 s
+and 519. Now only an HTTP 400/422 gets that retry.
 
-So, for this vendor on this network: **three of three runs after the fix finished under 90 s wall-clock (52, 75 and 56 s) with
-7 or 8 of 9 fields**, against one of the two before it. Three runs is a small sample. All five runs ended BLOCKED on DP-3.1
+So, for this vendor on this network: **three of three runs at `69df346` finished under 90 s wall-clock (52, 75 and 56 s) with
+7 or 8 of 9 fields**, against one of the two before it. Three runs is a small sample, and none of them reached the 30 s cap
+(slowest extract call 26.6 s) or used the parameter fallback, so they show MiniMax was not stalling that time, not that the cap
+worked; the unit tests are what show that. All five runs ended BLOCKED on DP-3.1
 (customer data stored in India), the same verdict from the same facts; the requirements left UNKNOWN varied between one and two.
 DuckDuckGo from this network still fails some queries (1 to 7 per run) and no Tavily key is configured, so
 `SEARCH_PROVIDER=tavily` is untested. No live accuracy figure against `data/gold_set_real.json` has been measured.

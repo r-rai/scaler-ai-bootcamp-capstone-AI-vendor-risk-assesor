@@ -228,8 +228,11 @@ class LLM:
         if getattr(b, "max_seconds", 0):
             left = b.max_seconds - b.elapsed_s
             timeout = min(timeout, max(3.0, left - 1.0))
-            while retries and (retries + 1) * timeout > max(left, 0):
-                retries -= 1
+            if self.role in ("small", "extract"):
+                # These run inside the research deadline, where a stalled call is expensive. Main-role calls keep their
+                # retries: a 429, 5xx or dropped connection costs about a second to retry, not a full timeout.
+                while retries and (retries + 1) * timeout > max(left, 0):
+                    retries -= 1
         return timeout, retries
 
     def _complete(self, messages: list[dict], *, stage: str, **kw):

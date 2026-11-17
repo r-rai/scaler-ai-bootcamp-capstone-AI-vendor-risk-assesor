@@ -105,3 +105,13 @@ def test_retries_shrink_so_that_all_attempts_fit_in_the_time_left(monkeypatch):
 def test_a_local_model_is_never_retried_by_the_sdk(monkeypatch):
     obj = make_llm(monkeypatch, FakeClient([]), role="small")
     assert obj._call_limits({**CFG, "local": True})[1] == 0
+
+
+def test_main_role_keeps_its_sdk_retries_inside_a_normal_budget(monkeypatch):
+    """Trimming retries to fit the deadline is for the research roles only: a main-role call with a 90 s budget must
+    still retry a 429 or a dropped connection."""
+    obj = make_llm(monkeypatch, FakeClient([]), role="main", max_seconds=90.0, elapsed=0.0)
+    assert obj._call_limits(CFG) == (SETTINGS.llm_timeout_s, 2)
+    near_end = make_llm(monkeypatch, FakeClient([]), role="main", max_seconds=90.0, elapsed=85.0)
+    timeout, retries = near_end._call_limits(CFG)
+    assert timeout <= 5.0 and retries == 2           # the attempt is still bounded by the time left
