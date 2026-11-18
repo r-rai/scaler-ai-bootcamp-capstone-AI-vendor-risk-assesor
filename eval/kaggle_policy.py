@@ -18,7 +18,9 @@ What is deliberately NOT here: any pattern written from the training pages. Read
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
@@ -133,13 +135,36 @@ def user_prompt(page: dict) -> str:
             f"<untrusted_page_data>\n{body}\n</untrusted_page_data>")
 
 
-def cache_key(model: str, page: dict) -> str:
-    """Page text + URL + prompt + schema + model: a prompt or model change can never reuse a stale extraction."""
+def cache_key(model: str, page: dict, salt: str = "") -> str:
+    """Page text + URL + prompt + schema + model: a prompt or model change can never reuse a stale extraction.
+
+    `salt` draws an independent sample for the SAME prompt (run-to-run noise measurements). An empty salt adds nothing, so every
+    key written before the salt existed is still found; a salted key can never collide with an unsalted one."""
     h = hashlib.sha256()
-    for part in (model, EXTRACT_SYSTEM, "ClaimList", user_prompt(page)):
+    for part in (model, EXTRACT_SYSTEM, "ClaimList", user_prompt(page)) + (("salt:" + salt,) if salt else ()):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
+
+
+def claim_signature(claims: list) -> dict[str, str]:
+    """A comparable, order-free summary of what a page says, per field (the unit the paraphrase probe and the noise comparison share)."""
+    out: dict[str, list] = defaultdict(list)
+    for c in claims:
+        v = c.value
+        if c.field == "security_certifications":
+            out[c.field] += [(x["name"], x["status"], x["date"], x["valid_until"], bool(x["issuer"])) for x in v]
+        elif c.field == "subprocessors":
+            out[c.field] += [(norm_entity(x["name"]), x["category"], norm_entity(x.get("country"))) for x in v]
+        elif c.field == "security_incidents":
+            out[c.field] += [(x["date"], x["severity"], x["postmortem_published"]) for x in v]
+        elif c.field == "data_regions":
+            out[c.field] += [("A", norm_entity(r)) for r in v["available"]] + [("P", norm_entity(r)) for r in v["planned"]]
+        elif c.field == "data_retention":
+            out[c.field].append((v["default_days"], v["deletion_on_request_days"]))
+        else:
+            out[c.field].append(v)
+    return {k: json.dumps(sorted(map(str, vs))) for k, vs in out.items()}
 
 
 # --------------------------------------------------------------------------------------------- claim normalisation

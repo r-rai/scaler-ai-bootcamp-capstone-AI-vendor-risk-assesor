@@ -84,15 +84,15 @@ def select_cases(cases: dict[str, dict], split: str, subset: str, limit: int | N
 class Extractor:
     """One page in, the model's raw claims out. The cache key covers page text + URL + prompt + schema + model."""
 
-    def __init__(self, llm: LLM, cache_dir: Path, cache_only: bool):
-        self.llm, self.dir, self.cache_only = llm, cache_dir, cache_only
+    def __init__(self, llm: LLM, cache_dir: Path, cache_only: bool, salt: str = ""):
+        self.llm, self.dir, self.cache_only, self.salt = llm, cache_dir, cache_only, salt
         self.model = llm.model                      # part of the cache key, so --cache-only must know it too
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.hits = self.misses = 0
 
     def run(self, page: dict) -> dict:
-        key = kp.cache_key(self.model, page)
+        key = kp.cache_key(self.model, page, self.salt)      # a salted run neither reads nor overwrites unsalted entries
         path = self.dir / f"{key}.json"
         if path.exists():
             rec = json.loads(path.read_text(encoding="utf-8"))
@@ -120,7 +120,7 @@ class Extractor:
         tin = estimate_tokens(kp.EXTRACT_SYSTEM + kp.user_prompt(page))
         tout = estimate_tokens(json.dumps(claims))
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"model": self.model, "claims": claims, "in": tin, "out": tout}), encoding="utf-8")
+        tmp.write_text(json.dumps({"model": self.model, "salt": self.salt, "claims": claims, "in": tin, "out": tout}), encoding="utf-8")
         tmp.replace(path)
         with self.lock:
             self.misses += 1
@@ -150,6 +150,49 @@ def strip_internal(facts: dict) -> dict:
     return out
 
 
+def triage(case: dict, pages: list[dict]) -> list[dict]:
+    """Free, no LLM: who may speak on each page, and which pages the injection quarantine holds back."""
+    recs = []
+    for p in pages:
+        role, why = kp.classify_page(p, case)
+        rec = {"page": p, "role": role, "why": why, "quarantine": [], "extract": None}
+        if role != "ignored":
+            if len((p.get("text") or "").strip()) < kp.MIN_PAGE_CHARS:
+                rec["role"], rec["why"] = "ignored", "no readable text"
+            else:
+                rec["quarantine"] = kp.quarantine_hits(p)
+        recs.append(rec)
+    return recs
+
+
+def readable(rec: dict) -> bool:
+    return rec["role"] != "ignored" and not rec["quarantine"]
+
+
+def assemble_case(case: dict, recs: list[dict], reqs: list[dict], rl, subprocessors: str = "newest_page", certs: str = "newest_page") -> dict:
+    """One case from its pages' (already extracted) claims to verdicts: normalise -> holder check -> merge -> rules_lite + our matcher."""
+    as_of = date.fromisoformat(case["as_of"])
+    items, notes, bad = [], [], 0
+    for r in recs:
+        if not readable(r):
+            continue
+        ex = r["extract"]
+        if not ex or ex["status"] != "ok":
+            bad += 1
+            continue
+        claims, why = kp.normalise_page_claims([Claim.model_validate(c) for c in ex["claims"]])
+        notes += [f"{r['page']['page_id']}: dropped {w}" for w in why]
+        pc = kp.PageClaims(r["page"]["page_id"], r["role"], kp.page_date(r["page"]), claims)
+        notes += kp.check_holders(pc, case["legal_entity"])
+        items.append(pc)
+    merged = kp.build_facts(items, as_of, subprocessors=subprocessors, certs=certs)
+    facts = strip_internal(merged.facts)
+    v = rl.evaluate(facts, reqs, case["tier"], int(case["users"]), as_of)
+    ours, ours_ov = our_matcher_verdicts(reqs, case, facts, as_of)
+    return {"facts": facts, "verdicts": v, "overall": rl.overall(v, reqs), "ours": ours, "ours_overall": ours_ov,
+            "notes": notes + merged.notes, "conflicts": merged.conflicts, "bad": bad}
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -163,6 +206,8 @@ def main() -> int:
     ap.add_argument("--cache-only", action="store_true", help="never call the LLM; pages not in the cache are reported as not extracted")
     ap.add_argument("--subprocessors", choices=["newest_page", "union"], default="newest_page")
     ap.add_argument("--certs", choices=["newest_page", "union_by_name"], default="newest_page")
+    ap.add_argument("--cache-salt", default="", help="draw an independent sample of the SAME prompt (noise measurement). Empty = the normal cache. "
+                    "A salted run never reads or overwrites unsalted entries and never writes a submission file.")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -179,25 +224,13 @@ def main() -> int:
     llm = LLM.extractor(budget=budget)
     if llm.mock_mode:
         sys.exit("The extractor is on the mock provider: the cache is keyed by model, so set the real provider (via .env) even for --cache-only.")
-    extractor = Extractor(llm, data / "cache" / "extract", a.cache_only)
+    extractor = Extractor(llm, data / "cache" / "extract", a.cache_only, a.cache_salt)
     print(f"extractor: provider={llm.provider} model={llm.model}  prompt={kp.PROMPT_VERSION}  cap=${a.max_usd:.2f}"
-          + ("  (cache-only: no calls)" if a.cache_only else ""))
+          + ("  (cache-only: no calls)" if a.cache_only else "") + (f"  SALT={a.cache_salt!r} (independent sample)" if a.cache_salt else ""))
 
     # ---- 1. triage (free) ----
-    plan: dict[str, list[dict]] = {}
-    for cid in ids:
-        recs = []
-        for p in pages[cid]:
-            role, why = kp.classify_page(p, cases[cid])
-            rec = {"page": p, "role": role, "why": why, "quarantine": [], "extract": None}
-            if role != "ignored":
-                if len((p.get("text") or "").strip()) < kp.MIN_PAGE_CHARS:
-                    rec["role"], rec["why"] = "ignored", "no readable text"
-                else:
-                    rec["quarantine"] = kp.quarantine_hits(p)
-            recs.append(rec)
-        plan[cid] = recs
-    jobs = [(cid, r) for cid in ids for r in plan[cid] if r["role"] != "ignored" and not r["quarantine"]]
+    plan: dict[str, list[dict]] = {cid: triage(cases[cid], pages[cid]) for cid in ids}
+    jobs = [(cid, r) for cid in ids for r in plan[cid] if readable(r)]
     print(f"{len(ids)} cases, {sum(len(plan[c]) for c in ids)} pages, {len(jobs)} to read "
           f"({Counter(r['role'] for c in ids for r in plan[c])})")
 
@@ -228,38 +261,21 @@ def main() -> int:
     case_log: list[dict] = []
     disagreements: list[dict] = []
     for cid in ids:
-        case, as_of = cases[cid], date.fromisoformat(cases[cid]["as_of"])
-        items, notes, bad = [], [], 0
-        for r in plan[cid]:
-            if r["role"] == "ignored" or r["quarantine"]:
-                continue
-            ex = r["extract"]
-            if not ex or ex["status"] != "ok":
-                bad += 1
-                continue
-            claims, why = kp.normalise_page_claims([Claim.model_validate(c) for c in ex["claims"]])
-            notes += [f"{r['page']['page_id']}: dropped {w}" for w in why]
-            pc = kp.PageClaims(r["page"]["page_id"], r["role"], kp.page_date(r["page"]), claims)
-            notes += kp.check_holders(pc, case["legal_entity"])
-            items.append(pc)
-        merged = kp.build_facts(items, as_of, subprocessors=a.subprocessors, certs=a.certs)
-        facts = strip_internal(merged.facts)
-        v = rl.evaluate(facts, reqs, case["tier"], int(case["users"]), as_of)
-        ov = rl.overall(v, reqs)
-        ours, ours_ov = our_matcher_verdicts(reqs, case, facts, as_of)
+        res = assemble_case(cases[cid], plan[cid], reqs, rl, a.subprocessors, a.certs)
+        v, ov, bad = res["verdicts"], res["overall"], res["bad"]
         for rid, vv in v.items():
-            if ours.get(rid) != vv:
-                disagreements.append({"case_id": cid, "requirement_id": rid, "rules_lite": vv, "assessor_matcher": ours.get(rid)})
-        if ours_ov != ov:
-            disagreements.append({"case_id": cid, "requirement_id": "OVERALL", "rules_lite": ov, "assessor_matcher": ours_ov})
+            if res["ours"].get(rid) != vv:
+                disagreements.append({"case_id": cid, "requirement_id": rid, "rules_lite": vv, "assessor_matcher": res["ours"].get(rid)})
+        if res["ours_overall"] != ov:
+            disagreements.append({"case_id": cid, "requirement_id": "OVERALL", "rules_lite": ov, "assessor_matcher": res["ours_overall"]})
         is_complete = bad == 0
         if is_complete:
             complete.append(cid)
         for rid, vv in v.items():
             preds[f"{cid}__{rid}"] = vv
         preds[f"{cid}__OVERALL"] = ov
-        case_log.append({"case_id": cid, "complete": is_complete, "unextracted_pages": bad, "facts": facts, "notes": notes + merged.notes,
-                         "conflicts": merged.conflicts, "verdicts": v, "overall": ov,
+        case_log.append({"case_id": cid, "complete": is_complete, "unextracted_pages": bad, "facts": res["facts"], "notes": res["notes"],
+                         "conflicts": res["conflicts"], "verdicts": v, "overall": ov,
                          "pages": [{"id": r["page"]["page_id"], "role": r["role"], "why": r["why"], "date": kp.page_date(r["page"]),
                                     "quarantine": r["quarantine"], "extract": (r["extract"] or {}).get("status"), "error": (r["extract"] or {}).get("error"),
                                     "claims": [c["field"] for c in (r["extract"] or {}).get("claims", [])]}
@@ -287,7 +303,9 @@ def main() -> int:
              f"- prompt version {kp.PROMPT_VERSION}; our-matcher vs rules_lite disagreements: {len(disagreements)}"]
 
     # ---- 5. outputs / score ----
-    if a.split == "test":
+    if a.split == "test" and a.cache_salt:
+        lines.append("- submission.csv NOT written: a salted run is a noise sample, never a submission candidate.")
+    elif a.split == "test":
         test_rows = list(csv.DictReader((data / "test.csv").open(encoding="utf-8")))
         if len(complete) == len(ids) and len(ids) == len({r["case_id"] for r in test_rows}):
             with (out / "submission.csv").open("w", newline="", encoding="utf-8") as f:

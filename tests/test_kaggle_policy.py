@@ -75,6 +75,71 @@ def test_cache_key_changes_with_text_model_and_prompt(monkeypatch):
     assert kp.cache_key("m1", p) != base
 
 
+def test_an_empty_salt_reproduces_the_legacy_cache_key_exactly():
+    """Every extraction cached before the salt existed (incl. the whole test set) must still be found."""
+    import hashlib
+    p = page("https://acme.example/a")
+    h = hashlib.sha256()
+    for part in ("m1", kp.EXTRACT_SYSTEM, "ClaimList", kp.user_prompt(p)):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    assert kp.cache_key("m1", p) == kp.cache_key("m1", p, "") == h.hexdigest()
+
+
+def test_a_salt_gives_an_independent_key_per_salt():
+    p = page("https://acme.example/a")
+    assert len({kp.cache_key("m1", p), kp.cache_key("m1", p, "a"), kp.cache_key("m1", p, "b")}) == 3
+    assert kp.cache_key("m1", p, "a") == kp.cache_key("m1", p, "a")
+
+
+def _load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, _dir / filename)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeLLM:
+    model = "m1"
+
+    def __init__(self, value="no"):
+        self.calls, self.value = 0, value
+
+    def structured(self, system, user, schema, stage=""):
+        self.calls += 1
+        return schema(claims=[Claim(field="trains_on_customer_data", value=self.value, display=self.value)])
+
+
+def test_a_salted_extractor_never_reads_or_overwrites_the_unsalted_cache(tmp_path):
+    rk = _load("run_kaggle_under_test", "run_kaggle.py")
+    llm, p = _FakeLLM("no"), page("https://acme.example/a")
+    rk.Extractor(llm, tmp_path, False).run(p)
+    (unsalted,) = list(tmp_path.glob("*.json"))
+    before = unsalted.read_bytes()
+    salted_only = rk.Extractor(llm, tmp_path, True, "s1")
+    assert salted_only.run(p)["status"] == "not_cached"                # the unsalted entry is invisible to a salted run
+    llm.value = "yes"                                                   # an independent sample may differ
+    got = rk.Extractor(llm, tmp_path, False, "s1").run(p)
+    assert llm.calls == 2 and got["claims"][0]["value"] == "yes" and not got["cached"]
+    assert unsalted.read_bytes() == before and len(list(tmp_path.glob("*.json"))) == 2
+    assert rk.Extractor(llm, tmp_path, True, "s1").run(p)["cached"]     # the salted sample is reusable for free
+    assert rk.Extractor(llm, tmp_path, True).run(p)["claims"][0]["value"] == "no"    # and the unsalted one is untouched
+
+
+def test_noise_comparison_counts_page_disagreements_and_verdict_flips():
+    cs = _load("compare_samples_under_test", "compare_samples.py")
+    a = [claim("trains_on_customer_data", "no").model_dump(mode="json"), claim("dpa_available", "yes").model_dump(mode="json")]
+    same_reordered = list(reversed(a))
+    assert all(cs.page_agreement(a, same_reordered).values())
+    b = [claim("trains_on_customer_data", "opt_out_available").model_dump(mode="json"), claim("dpa_available", "yes").model_dump(mode="json")]
+    assert cs.page_agreement(a, b) == {"trains_on_customer_data": False, "dpa_available": True}
+    ra = {"verdicts": {"AI-2.1": "PASS", "DP-2.2": "FAIL"}, "overall": "BLOCKED"}
+    rb = {"verdicts": {"AI-2.1": "PASS", "DP-2.2": "UNKNOWN"}, "overall": "CONDITIONAL"}
+    assert cs.flips(ra, ra) == []
+    assert cs.flips(ra, rb) == [("DP-2.2", "FAIL", "UNKNOWN"), ("OVERALL", "BLOCKED", "CONDITIONAL")]
+
+
 # ---------------------------------------------------------------- normalisation
 def claim(field, value, **kw):
     return Claim(field=field, value=value, display=kw.pop("display", str(value)[:50]), **kw)
