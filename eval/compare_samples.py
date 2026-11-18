@@ -85,6 +85,7 @@ def main() -> int:
     cache = data / "cache" / "extract"
 
     pages_total = pages_both = identical = 0
+    pool_n = pool_identical = 0         # the paraphrase probe's pool: official pages that yielded claims in sample A
     per_field, per_field_diff = Counter(), Counter()
     page_diffs: list[dict] = []
     case_rows, all_flips = [], []
@@ -104,6 +105,9 @@ def main() -> int:
             pages_both += 1
             agree = page_agreement(ra["extract"]["claims"], rb["extract"]["claims"])
             identical += all(agree.values())
+            if ra["role"] == "official" and ra["extract"]["claims"]:
+                pool_n += 1
+                pool_identical += all(agree.values())
             for f, same in agree.items():
                 per_field[f] += 1
                 if not same:
@@ -125,7 +129,9 @@ def main() -> int:
     lines = [f"# Noise between two samples of prompt {kp.PROMPT_VERSION}: {a.split}/{a.subset}, salt {a.salt!r}", "",
              f"- cases compared: {len(case_rows)} of {len(ids)} ({len(skipped)} left out: a page missing from one of the samples)",
              f"- pages: {pages_both} read in both samples of {pages_total} readable; **identical claims on every field: {identical} ({identical / max(1, pages_both):.1%})**"
-             f"  (the paraphrase probe measured 93.3% for reworded pages: this is the baseline for that number)",
+             f"",
+             f"- like for like with the paraphrase probe (official pages that yielded claims in A): identical on every field {pool_identical} of {pool_n} "
+             f"(**{pool_identical / max(1, pool_n):.1%}**; the probe measured 93.3% on reworded pages, so this is the baseline for that number)",
              f"- **verdicts that flip between A and B: N = {len(all_flips)} of {n_verdicts}** "
              f"(in {len({f['case_id'] for f in all_flips})} cases). Config changes that move at most N verdicts are not shown to matter.", ""]
     if a.split == "train" and preds_a:
