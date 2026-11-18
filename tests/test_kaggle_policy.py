@@ -140,6 +140,29 @@ def test_noise_comparison_counts_page_disagreements_and_verdict_flips():
     assert cs.flips(ra, rb) == [("DP-2.2", "FAIL", "UNKNOWN"), ("OVERALL", "BLOCKED", "CONDITIONAL")]
 
 
+def test_the_prompt_defines_the_training_and_dpa_values_and_forbids_answers_from_silence():
+    t = kp.EXTRACT_SYSTEM
+    assert "Never return 'no' because a page does not mention training" in t
+    assert "Decide by the facts, not by the order of the clauses" in t and "'opt_out_available': customer content may be used" in t
+    assert "merely does not mention a DPA states nothing" in t
+
+
+def _case(verdicts, facts, overall="CONDITIONAL"):
+    return {"verdicts": verdicts, "facts": facts, "overall": overall}
+
+
+def test_abstention_guard_flags_a_prompt_that_only_got_quieter():
+    ag = _load("abstention_guard_under_test", "abstention_guard.py")
+    have = {"trains_on_customer_data": {"value": "no"}, "dpa_available": {"value": "yes"}, "sso_saml": {"value": "all_plans"}}
+    a = [_case({"AI-2.1": "PASS"}, have) for _ in range(100)]
+    quiet = [_case({"AI-2.1": "UNKNOWN" if i < 10 else "PASS"}, {**have, "trains_on_customer_data": {"value": None}} if i < 10 else have) for i in range(100)]
+    _, problems = ag.judge(a, quiet, 3.0, 0.95)
+    assert len(problems) == 2 and "AI-2.1" in problems[0] and "trains_on_customer_data" in problems[1]
+    assert ag.judge(a, a, 3.0, 0.95)[1] == []
+    near = [_case({"AI-2.1": "UNKNOWN" if i < 2 else "PASS"}, have) for i in range(100)]      # a 2-point shift is within the limit
+    assert ag.judge(a, near, 3.0, 0.95)[1] == []
+
+
 # ---------------------------------------------------------------- normalisation
 def claim(field, value, **kw):
     return Claim(field=field, value=value, display=kw.pop("display", str(value)[:50]), **kw)
