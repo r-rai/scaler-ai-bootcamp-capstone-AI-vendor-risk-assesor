@@ -20,9 +20,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import sys
+import types
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from typing import Any, Optional
 
 from assessor import injection
@@ -144,13 +149,41 @@ def user_prompt(page: dict) -> str:
             f"<untrusted_page_data>\n{body}\n</untrusted_page_data>")
 
 
-def cache_key(model: str, page: dict, salt: str = "") -> str:
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def prompt_text_from_git(rev: str, expect_version: str, repo: Path = ROOT) -> str:
+    """The extraction prompt as it stood at commit `rev` of this repo, byte for byte. Selecting a prompt is not editing it.
+
+    EXTRACT_SYSTEM is an f-string over names the module imports, so the file is executed as of `rev` (from this repo's own history,
+    never from outside it) under a throwaway module name that is removed again, so the live `kaggle_policy` is never shadowed.
+    The text is returned only if sha256(text)[:12] equals `expect_version`; a wrong commit or a drifted dependency fails loudly."""
+    if not rev or rev.startswith("-"):
+        raise ValueError(f"not a revision: {rev!r}")
+    src = subprocess.run(["git", "-C", str(repo), "show", f"{rev}:eval/kaggle_policy.py"], capture_output=True, text=True, check=True).stdout
+    name = f"_kaggle_policy_rev_{uuid.uuid4().hex[:8]}"
+    mod = types.ModuleType(name)
+    mod.__file__ = f"<{rev}:eval/kaggle_policy.py>"
+    sys.modules[name] = mod                      # dataclasses and typing look the module up by name while the file runs
+    try:
+        exec(compile(src, mod.__file__, "exec"), mod.__dict__)  # noqa: S102
+        text = mod.EXTRACT_SYSTEM
+    finally:
+        sys.modules.pop(name, None)
+    got = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    if got != expect_version:
+        raise ValueError(f"the prompt at {rev} has version {got}, not the expected {expect_version}")
+    return text
+
+
+def cache_key(model: str, page: dict, salt: str = "", system: str | None = None) -> str:
     """Page text + URL + prompt + schema + model: a prompt or model change can never reuse a stale extraction.
 
     `salt` draws an independent sample for the SAME prompt (run-to-run noise measurements). An empty salt adds nothing, so every
-    key written before the salt existed is still found; a salted key can never collide with an unsalted one."""
+    key written before the salt existed is still found; a salted key can never collide with an unsalted one.
+    `system` is the prompt text to key by (None = the current EXTRACT_SYSTEM), so a prompt chosen from an older commit finds its own entries."""
     h = hashlib.sha256()
-    for part in (model, EXTRACT_SYSTEM, "ClaimList", user_prompt(page)) + (("salt:" + salt,) if salt else ()):
+    for part in (model, system or EXTRACT_SYSTEM, "ClaimList", user_prompt(page)) + (("salt:" + salt,) if salt else ()):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()

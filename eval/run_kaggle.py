@@ -25,10 +25,12 @@ import csv
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -84,15 +86,16 @@ def select_cases(cases: dict[str, dict], split: str, subset: str, limit: int | N
 class Extractor:
     """One page in, the model's raw claims out. The cache key covers page text + URL + prompt + schema + model."""
 
-    def __init__(self, llm: LLM, cache_dir: Path, cache_only: bool, salt: str = ""):
+    def __init__(self, llm: LLM, cache_dir: Path, cache_only: bool, salt: str = "", system: str | None = None):
         self.llm, self.dir, self.cache_only, self.salt = llm, cache_dir, cache_only, salt
+        self.system = system or kp.EXTRACT_SYSTEM    # the prompt text; select_prompt() can pick an older one from git, unedited
         self.model = llm.model                      # part of the cache key, so --cache-only must know it too
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.hits = self.misses = 0
 
     def run(self, page: dict) -> dict:
-        key = kp.cache_key(self.model, page, self.salt)      # a salted run neither reads nor overwrites unsalted entries
+        key = kp.cache_key(self.model, page, self.salt, system=self.system)      # a salted run neither reads nor overwrites unsalted entries
         path = self.dir / f"{key}.json"
         if path.exists():
             rec = json.loads(path.read_text(encoding="utf-8"))
@@ -104,7 +107,7 @@ class Extractor:
         res, err = None, ""
         for attempt in range(5):
             try:
-                res = self.llm.structured(kp.EXTRACT_SYSTEM, kp.user_prompt(page), ClaimList, stage="extract")
+                res = self.llm.structured(self.system, kp.user_prompt(page), ClaimList, stage="extract")
                 break
             except BudgetExceeded:
                 raise
@@ -117,7 +120,7 @@ class Extractor:
             return {"status": "failed", "error": err, "claims": [], "in": 0, "out": 0, "cached": False}
         claims = [c.model_dump(mode="json") for c in res.claims]
         # ~4 chars/token estimates (per-page usage cannot be read back reliably under concurrency); real spend comes from the Budget
-        tin = estimate_tokens(kp.EXTRACT_SYSTEM + kp.user_prompt(page))
+        tin = estimate_tokens(self.system + kp.user_prompt(page))
         tout = estimate_tokens(json.dumps(claims))
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"model": self.model, "salt": self.salt, "claims": claims, "in": tin, "out": tout}), encoding="utf-8")
@@ -125,6 +128,43 @@ class Extractor:
         with self.lock:
             self.misses += 1
         return {"status": "ok", "claims": claims, "in": tin, "out": tout, "cached": False}
+
+
+# ------------------------------------------------------------------------------------------------ estimate a run before it starts
+OUT_PER_IN = 282_140 / 3_408_090      # output tokens per input token, measured on the full test pass of reports/kaggle_test_v6/report.md
+SEC_PER_PAGE = (1.1, 2.5)             # wall seconds per page at 6 workers: low = base-prompt test runs (41-45 min), high = f45b runs (97 min)
+
+
+def estimate_call_tokens(pages: list[dict], system: str) -> tuple[int, int]:
+    """(tokens in, tokens out) for calling `pages`: input counted the way the runner records it, output by the measured ratio."""
+    tin = sum(estimate_tokens(system + kp.user_prompt(p)) for p in pages)
+    return tin, round(tin * OUT_PER_IN)
+
+
+def uncached_pages(pages: list[dict], cache_dir: Path, model: str, salt: str, system: str) -> tuple[list[dict], list[dict]]:
+    """(already cached, still to call) for this prompt + model + salt. Only looks; never writes."""
+    hit = [(cache_dir / f"{kp.cache_key(model, p, salt, system=system)}.json").exists() for p in pages]
+    return [p for p, h in zip(pages, hit) if h], [p for p, h in zip(pages, hit) if not h]
+
+
+def format_estimate(n_call: int, n_cached: int, tokens_in: int, tokens_out: int) -> str:
+    lo, hi = (round(n_call * s / 60) for s in SEC_PER_PAGE)
+    return f"pages to call {n_call} (cached {n_cached}); tokens in {tokens_in:,} / out {tokens_out:,}; time {lo}-{hi} min at the measured pace"
+
+
+def select_prompt(prompt_commit: str, expect_prompt: str) -> tuple[str, str]:
+    """(system text, version) for this run. No commit = the current prompt. A commit must come with the version it is expected to hold:
+    the text is read from git unedited and refused unless its hash matches, so selecting an older prompt can never become editing one."""
+    if not prompt_commit:
+        if expect_prompt and expect_prompt != kp.PROMPT_VERSION:
+            sys.exit(f"--expect-prompt {expect_prompt} but the current prompt is {kp.PROMPT_VERSION}")
+        return kp.EXTRACT_SYSTEM, kp.PROMPT_VERSION
+    if not expect_prompt:
+        sys.exit("--prompt-commit needs --expect-prompt VERSION (the 12-character prompt hash it must produce)")
+    try:
+        return kp.prompt_text_from_git(prompt_commit, expect_prompt), expect_prompt
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"cannot select the prompt from {prompt_commit}: {exc}")
 
 
 # ------------------------------------------------------------------------------------------------ verdicts
@@ -193,6 +233,27 @@ def assemble_case(case: dict, recs: list[dict], reqs: list[dict], rl, subprocess
             "notes": notes + merged.notes, "conflicts": merged.conflicts, "bad": bad}
 
 
+def write_submission(path: Path, test_rows: list[dict], preds: Mapping[str, str], metric) -> list[str]:
+    """Write `path` (id,verdict) in test.csv order, then check it the way the leaderboard would: ids, duplicates, labels (kaggle_policy) and the
+    host's own metric.py on a dummy solution. A missing id defaults to UNKNOWN (CONDITIONAL for OVERALL). Returns the problems; [] = OK."""
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "verdict"])
+        for r in test_rows:
+            w.writerow([r["id"], preds.get(r["id"], "UNKNOWN" if not r["id"].endswith("__OVERALL") else "CONDITIONAL")])
+    with path.open(encoding="utf-8") as f:
+        back = list(csv.DictReader(f))
+    problems = kp.validate_submission([r["id"] for r in test_rows], [(r["id"], r["verdict"]) for r in back])
+    try:        # the host's own scorer must accept the file: a dummy solution with the right row kinds
+        import pandas as pd
+        dummy = pd.DataFrame({"id": [r["id"] for r in test_rows],
+                              "verdict": ["CONDITIONAL" if r["id"].endswith("__OVERALL") else "PASS" for r in test_rows]})
+        metric.components(dummy, pd.DataFrame(back))
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"metric.py rejected the file: {exc}")
+    return problems
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -208,8 +269,16 @@ def main() -> int:
     ap.add_argument("--certs", choices=["newest_page", "union_by_name"], default="newest_page")
     ap.add_argument("--cache-salt", default="", help="draw an independent sample of the SAME prompt (noise measurement). Empty = the normal cache. "
                     "A salted run never reads or overwrites unsalted entries and never writes a submission file.")
+    ap.add_argument("--prompt-commit", default="", help="run the extraction prompt exactly as it was at this git commit (selecting a prompt is not "
+                    "editing it); needs --expect-prompt. Empty = the current prompt.")
+    ap.add_argument("--expect-prompt", default="", help="the 12-character prompt version the run must use; refused if the text hashes differently")
+    ap.add_argument("--estimate", action="store_true", help="triage, count the pages still to call for this prompt+model+salt, print tokens and a "
+                    "time range, then exit before any LLM call and without writing any file")
+    ap.add_argument("--no-score", action="store_true", help="skip the comparison with the train labels (no score, no misses.csv): a draw whose "
+                    "per-sample score must not be seen")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
+    system, prompt_version = select_prompt(a.prompt_commit, a.expect_prompt)
 
     data = Path(a.data)
     cases, pages = load_cases(data), load_pages(data)
@@ -218,14 +287,13 @@ def main() -> int:
     metric = load_module("kaggle_metric", data / "metric.py")
     ids = select_cases(cases, a.split, a.subset, a.limit or None, [c for c in a.cases.split(",") if c])
     out = Path(a.out) if a.out else ROOT / "reports" / f"kaggle_{a.split}_{a.subset}_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}"
-    out.mkdir(parents=True, exist_ok=True)
 
     budget = Budget(max_usd=a.max_usd, max_seconds=0, max_tokens=0, max_tool_calls=0)
     llm = LLM.extractor(budget=budget)
     if llm.mock_mode:
         sys.exit("The extractor is on the mock provider: the cache is keyed by model, so set the real provider (via .env) even for --cache-only.")
-    extractor = Extractor(llm, data / "cache" / "extract", a.cache_only, a.cache_salt)
-    print(f"extractor: provider={llm.provider} model={llm.model}  prompt={kp.PROMPT_VERSION}  cap=${a.max_usd:.2f}"
+    extractor = Extractor(llm, data / "cache" / "extract", a.cache_only, a.cache_salt, system=system)
+    print(f"extractor: provider={llm.provider} model={llm.model}  prompt={prompt_version}  cap=${a.max_usd:.2f}"
           + ("  (cache-only: no calls)" if a.cache_only else "") + (f"  SALT={a.cache_salt!r} (independent sample)" if a.cache_salt else ""))
 
     # ---- 1. triage (free) ----
@@ -233,6 +301,11 @@ def main() -> int:
     jobs = [(cid, r) for cid in ids for r in plan[cid] if readable(r)]
     print(f"{len(ids)} cases, {sum(len(plan[c]) for c in ids)} pages, {len(jobs)} to read "
           f"({Counter(r['role'] for c in ids for r in plan[c])})")
+    if a.estimate:
+        cached, todo = uncached_pages([r["page"] for _, r in jobs], data / "cache" / "extract", llm.model, a.cache_salt, system)
+        print("estimate: " + format_estimate(len(todo), len(cached), *estimate_call_tokens(todo, system)))
+        return 0
+    out.mkdir(parents=True, exist_ok=True)
 
     # ---- 2. extraction ----
     t0, stopped, done = time.time(), "", 0
@@ -300,7 +373,7 @@ def main() -> int:
              f" (${est_all / max(1, len(ids)):.5f} per case, {len(jobs) / max(1, len(ids)):.1f} pages per case)",
              f"- wall time {wall:.0f}s with {a.workers} workers" + (f"; STOPPED: {stopped}" if stopped else ""),
              *( [f"- extraction FAILURES ({sum(fails.values())}): " + "; ".join(f"{n}x {m!r}" for m, n in fails.most_common(4))] if fails else [] ),
-             f"- prompt version {kp.PROMPT_VERSION}; our-matcher vs rules_lite disagreements: {len(disagreements)}"]
+             f"- prompt version {prompt_version}; our-matcher vs rules_lite disagreements: {len(disagreements)}"]
 
     # ---- 5. outputs / score ----
     if a.split == "test" and a.cache_salt:
@@ -308,21 +381,8 @@ def main() -> int:
     elif a.split == "test":
         test_rows = list(csv.DictReader((data / "test.csv").open(encoding="utf-8")))
         if len(complete) == len(ids) and len(ids) == len({r["case_id"] for r in test_rows}):
-            with (out / "submission.csv").open("w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["id", "verdict"])
-                for r in test_rows:
-                    w.writerow([r["id"], preds.get(r["id"], "UNKNOWN" if not r["id"].endswith("__OVERALL") else "CONDITIONAL")])
-            back = list(csv.DictReader((out / "submission.csv").open(encoding="utf-8")))
-            problems = kp.validate_submission([r["id"] for r in test_rows], [(r["id"], r["verdict"]) for r in back])
-            try:        # the host's own scorer must accept the file: a dummy solution with the right row kinds
-                import pandas as pd
-                dummy = pd.DataFrame({"id": [r["id"] for r in test_rows],
-                                      "verdict": ["CONDITIONAL" if r["id"].endswith("__OVERALL") else "PASS" for r in test_rows]})
-                metric.components(dummy, pd.DataFrame(back))
-            except Exception as exc:  # noqa: BLE001
-                problems.append(f"metric.py rejected the file: {exc}")
-            lines.append(f"- wrote {out / 'submission.csv'} ({len(back)} rows). NOT uploaded. Self-check: "
+            problems = write_submission(out / "submission.csv", test_rows, preds, metric)
+            lines.append(f"- wrote {out / 'submission.csv'} ({len(test_rows)} rows). NOT uploaded. Self-check: "
                          + ("OK (ids match test.csv, no duplicates, valid labels, metric.py accepts it)" if not problems else "FAILED: " + "; ".join(problems)))
             if problems:
                 (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -330,6 +390,8 @@ def main() -> int:
                 return 1
         else:
             lines.append("- submission.csv NOT written: not every test case is complete.")
+    elif a.no_score:
+        lines.append("\nScoring skipped (--no-score): this draw is read through the consensus code only, never judged on its own.")
     elif not complete:
         lines.append("\nNo complete cases, so nothing was scored.")
     else:
