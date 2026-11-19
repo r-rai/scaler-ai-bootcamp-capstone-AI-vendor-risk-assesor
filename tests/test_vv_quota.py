@@ -644,3 +644,97 @@ def test_the_wait_starts_only_after_a_call_in_flight_returns():
     a.join(timeout=10)
     b.join(timeout=10)
     assert inflight_at_sleep == [0] and gate.probes == 1 and gate.state == quota.OPEN
+
+
+# ---------------------------------------------------------------- fix round 1, I1 (ruling R39): a known status wins
+@pytest.mark.parametrize("status", [400, 401, 404, 405, 413, 415, 422])
+def test_a_known_non_quota_status_is_never_a_quota_error(status):
+    assert quota.NON_QUOTA_STATUSES == {400, 401, 404, 405, 413, 415, 422}
+    assert is_quota_error(llm_error("context length limit exceeded", status=status)) is None
+    assert is_quota_error(llm_error("HTTP 429 rate limit quota", status=status)) is None
+
+
+def test_a_429_inside_a_number_is_not_a_rate_limit():
+    assert is_quota_error(llm_error("maximum context length is 8192 tokens; you requested 14293 tokens", status=400)) is None
+    assert is_quota_error(LLMError("you requested 14293 tokens")) is None            # no status: word boundary only
+
+
+def test_status_less_rate_limit_wording_and_a_429_status_stay_rate_limit():
+    assert is_quota_error(LLMError("rate limit reached")) == "rate_limit"
+    assert is_quota_error(LLMError("429 Too Many Requests")) == "rate_limit"
+    assert is_quota_error(llm_error("slow down", status=429)) == "rate_limit"
+
+
+@pytest.mark.parametrize("status", [None, 402, 403, 429, 500, 503])
+def test_the_keyword_kind_needs_no_status_or_a_quota_like_one(status):
+    kind = is_quota_error(llm_error("insufficient balance on this key", status=status))
+    assert kind == ("rate_limit" if status == 429 else "keyword")
+
+
+def test_a_deterministic_400_is_one_failed_call_again(tmp_path, no_ladder_sleep):
+    llm = persistent(llm_error("context length limit exceeded; you requested 14293 tokens", status=400))
+    assert read_page(llm, CallCache(tmp_path), "ai", PAGE) == ([], ["failed: LLMError"])
+    assert llm.calls == 1 and no_ladder_sleep == []
+
+
+def test_an_oversized_page_400_is_a_failed_page_not_a_quota_stop(tmp_path, monkeypatch):
+    class Oversized(ReaderLLM):
+        def structured(self, system, user, schema, stage="", **kw):
+            if "Invented privacy page." in user:                      # p2 of every case
+                raise llm_error("context length limit exceeded; you requested 14293 tokens", status=400)
+            return super().structured(system, user, schema, stage=stage, **kw)
+    data = write_data(tmp_path / "data")
+    monkeypatch.setattr(runner, "build_agents", lambda a, d: (make_agents(tmp_path / "cache2", reader=Oversized()), None,
+                                                              StubMetric()))
+    rc = runner.main(["run", "--data", str(data), "--split", "test", "--subset", "all", "--out", str(tmp_path / "o2")])
+    rj = run_json(tmp_path / "o2")
+    assert rj["stopped_reason"] == "failed_pages" and rj["partial"] is True and rj["quota"] is None and rc == 3
+    assert rj["pages_failed"] == 3 and rj["cases_done"] == 3
+
+
+# ---------------------------------------------------------------- fix round 1, I2: the sleeper hands over to the probe atomically
+def test_no_second_sleeper_between_the_wait_and_the_probe():
+    clock = Clock()
+    ids = {}
+    parked, reacted = threading.Event(), threading.Event()
+    armed = [False]
+
+    def sleep(s):
+        ids["sleeper"] = threading.get_ident()
+        if len(clock.sleeps) == 0:
+            parked.wait(timeout=10)                         # the other worker is waiting at the gate before the wait ends
+            armed[0] = True
+        else:
+            reacted.set()                                   # a second sleeper (the race) reacted
+        clock.sleep(s)
+
+    gate = QuotaGate(wait=True, poll_seconds=60, max_seconds=600, clock=clock.now, sleep=sleep)
+
+    class HookCond(threading.Condition):
+        """After the sleeper's first release once its wait is over, let the parked worker run before the sleeper goes on."""
+
+        def wait(self, timeout=None):
+            if "sleeper" in ids and threading.get_ident() != ids["sleeper"]:
+                (reacted if armed[0] else parked).set()
+            return super().wait(timeout)
+
+        def __exit__(self, *exc):
+            out = super().__exit__(*exc)
+            if armed[0] and threading.get_ident() == ids.get("sleeper"):
+                armed[0] = False
+                reacted.wait(timeout=10)                    # the woken worker either waits again (correct) or sleeps (the race)
+            return out
+    gate._cond = HookCond()
+    gate.trip(QuotaExhausted("rate_limit", 429, ""))
+    res = []
+    s = threading.Thread(target=lambda: res.append(gate.run_case(lambda: "s")))
+    s.start()
+    for _ in range(200_000):                                # a zero-length thread yield, not a timed wait
+        if "sleeper" in ids:
+            break
+        time.sleep(0)
+    w = threading.Thread(target=lambda: res.append(gate.run_case(lambda: "w")))
+    w.start()
+    s.join(timeout=20)
+    w.join(timeout=20)
+    assert sorted(res) == ["s", "w"] and clock.sleeps == [60] and gate.waited_seconds == 60 and gate.probes == 1

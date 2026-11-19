@@ -1,7 +1,8 @@
 """Quota-window resilience for the paid (hosted MiniMax) calls: detection, a clean stop, an optional wait, an exact resume.
 
-UNVERIFIED: the real wording of MiniMax's 5-hour quota-window error is not known. `is_quota_error` recognises the repo's existing
-rate-limit rule (a 429) and a best-guess keyword list (`QUOTA_KEYWORDS`, ONE constant); neither has been checked against a real
+UNVERIFIED: the real wording of MiniMax's 5-hour quota-window error is not known. `is_quota_error` recognises a 429 (the status when
+it is known, else a whole-word "429" or "rate limit" in the message), and a best-guess keyword list (`QUOTA_KEYWORDS`, ONE constant);
+a known non-quota 4xx status (`NON_QUOTA_STATUSES`) is never a quota error (ruling R39). None of this has been checked against a real
 MiniMax quota error. The first quota error's status, kind and clipped message are written to run.json (never to the console) so the
 real text can be read after a run and the list corrected.
 
@@ -21,6 +22,7 @@ in the CallCache and a failed call never is, so a resume is the same command run
 from __future__ import annotations
 
 import contextvars
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -30,6 +32,12 @@ from assessor.llm import LLMError
 # UNVERIFIED best guess at the words of a quota-window error (lowercase substrings). Not checked against a real MiniMax error.
 QUOTA_KEYWORDS: tuple[str, ...] = ("quota", "usage limit", "limit exceeded", "insufficient balance")
 DETAIL_CHARS = 200
+# Ruling R39: a known HTTP status wins. These statuses are deterministic request errors (bad request, auth, not found, method, payload
+# too large, media type, unprocessable): never a quota error, whatever the message says (a 400 body can quote "14293 tokens" or
+# "limit exceeded"). The keyword kind applies only with no status or one of these (a real quota error may come as 402 or 403).
+NON_QUOTA_STATUSES: frozenset[int] = frozenset({400, 401, 404, 405, 413, 415, 422})
+_KEYWORD_STATUSES = frozenset({402, 403, 429})
+_429 = re.compile(r"\b429\b")
 # assessor/llm.py's repair-exhaustion error quotes the model's own (page-derived) output: it is never a quota error, and its text
 # must never reach run.json.
 _REPAIR_PREFIX = "Could not get valid "
@@ -59,17 +67,25 @@ def _status(exc: BaseException) -> int | None:
 
 
 def is_quota_error(exc: BaseException) -> str | None:
-    """"rate_limit" (the repo's rule: "429" in the message, "rate limit" in any case, or status 429), "keyword" (a QUOTA_KEYWORDS
-    word in the lowercased message; UNVERIFIED) or None. Never for the runner's cache-only refusal or the repair-exhaustion error."""
+    """"rate_limit", "keyword" or None (ruling R39: the HTTP status wins when it is known).
+    - status 429 -> "rate_limit"; a status in NON_QUOTA_STATUSES -> None for both kinds;
+    - only when NO status is known: "429" as a whole word or "rate limit" (any case) in the message -> "rate_limit";
+    - a QUOTA_KEYWORDS word (UNVERIFIED) in the lowercased message -> "keyword", only with no status, 402, 403 or a 5xx.
+    Never for the runner's cache-only refusal or the repair-exhaustion error."""
     if type(exc).__name__ == "NotCached":
         return None
     msg = str(exc)
     if msg.startswith(_REPAIR_PREFIX):
         return None
-    low = msg.lower()
-    if "429" in msg or "rate limit" in low or _status(exc) == 429:
+    status = _status(exc)
+    if status == 429:
         return "rate_limit"
-    if any(k in low for k in QUOTA_KEYWORDS):
+    if status in NON_QUOTA_STATUSES:
+        return None
+    low = msg.lower()
+    if status is None and (_429.search(msg) or "rate limit" in low):
+        return "rate_limit"
+    if (status is None or status in _KEYWORD_STATUSES or 500 <= status <= 599) and any(k in low for k in QUOTA_KEYWORDS):
         return "keyword"
     return None
 
@@ -205,16 +221,22 @@ class QuotaGate:
         t0 = self._clock()
         try:
             self._sleep(self.poll_seconds)
-        finally:
-            with self._cond:
+        except BaseException:
+            with self._cond:                            # the wait was interrupted: give the sleeper role back
                 self.waited_seconds += max(0.0, self._clock() - t0)
                 self._sleeper = False
                 self._cond.notify_all()
+            raise
+        # ONE critical section: the accounting, the end of the sleeper role and closed -> probing. Between two sections a woken
+        # worker would see "closed, no sleeper" and start a second wait (fix round 1, I2).
         with self._cond:
+            self.waited_seconds += max(0.0, self._clock() - t0)
+            self._sleeper = False
+            self._cond.notify_all()
             if self._aborted:
                 return "stop"
             if self.state != CLOSED:
-                return "again"                          # cannot happen while one sleeper holds the wait; look again
+                return "again"                          # cannot happen: only the sleeper leaves closed after a trip; look again
             self.state, self._probe_id = PROBING, object()
             self.probes += 1
             return "probe"
