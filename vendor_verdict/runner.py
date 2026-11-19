@@ -18,6 +18,10 @@ Per-role accounting (cases run in parallel, so the global CallCache counters can
   refuses the call (`NotCached`, an `LLMError`, so every agent treats it as its ordinary failed call) and counts `not_cached`;
 - failures come from the node flags in each case's state, seconds from the case traces (node -> role).
 
+The assessor's own LLM answer cache (`assessor.cache`) is switched off process-wide by `disable_assessor_cache` at the start of
+`run` and of `build_agents`, whatever was imported first: its key has no salt (a salted run would replay unsalted answers) and it
+would store competition page text under runs/cache. The agents' CallCache is the only cache.
+
 Console output is counts, model names and case ids only: never page text, a reading, a note or an exception message (class names only).
 """
 from __future__ import annotations
@@ -79,6 +83,21 @@ def role_of(name: str) -> str:
 def prompt_versions() -> dict[str, str]:
     return {"planner": version(PLANNER_SYSTEM), **{f"specialist:{f}": version(SPECIALIST_SYSTEM[f]) for f in FAMILIES},
             "router": version(ROUTER_SYSTEM), "grader": version(GRADER_SYSTEM), "decision_maker": version(DECISION_SYSTEM)}
+
+
+def disable_assessor_cache() -> None:
+    """Swap the assessor's process-wide LLM cache for a NullCache. Setting VRA_CACHE=0 is not enough: `SETTINGS` reads it once, at
+    the first `assessor` import, which may come before eval/run_kaggle's `setdefault`. `LLM.structured` asks `get_cache()` on every
+    call, so this holds for every model built before or after it."""
+    from assessor.cache import NullCache, set_cache
+    set_cache(NullCache())
+
+
+def make_budget(max_usd: float | None):
+    """The run's Budget. None (the CLI default) = no money cap: cost is not a concern (ruling R37'). 0 cannot mean "no cap", since
+    `Budget.exhausted` stops at spent >= max_usd. Wall time, tokens and tool calls are never capped (0 = off)."""
+    from assessor.tracing import Budget
+    return Budget(max_usd=float("inf") if max_usd is None else float(max_usd), max_seconds=0, max_tokens=0, max_tool_calls=0)
 
 
 # ------------------------------------------------------------------------------------------------ JSON hygiene
@@ -403,6 +422,7 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
     if engine not in ("plain", "langgraph"):
         raise ValueError(f"unknown engine {engine!r}")
     t_start = time.perf_counter()
+    disable_assessor_cache()
     data_dir, out = Path(data_dir), Path(out)
     cases, pages, ids = load_split(data_dir, split, subset, limit, only)
     ids = sorted(ids)
@@ -482,12 +502,17 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
     readable = sum(results[c]["readable"] for c in finished)
     unrouted = sum(results[c]["unrouted"] for c in finished)
     unfinished = [c for c in ids if c not in results and c not in errors]
+    roles = _roles(cache, list(llms.values()), flags, seconds)
+    not_cached = sum(roles[r]["not_cached"] for r in ROLES)
+    # a cache-only miss of ANY role (a grader, planner or decision prompt changed, or a put failed when the cache was filled) turns
+    # into a fallback (unsure, abstain, no plan): the verdicts are not the cached run's, so the run is partial
     reasons = [name for name, hit in (("failed_pages", bool(failed_pages)), (stopped or "", stopped is not None),
-                                      ("case_errors", bool(errors)), ("unfinished_cases", bool(unfinished))) if hit]
+                                      ("cache_misses", cache_only and not_cached > 0), ("case_errors", bool(errors)),
+                                      ("unfinished_cases", bool(unfinished))) if hit]
     partial = bool(reasons)
-    # one word for the run: a stop wins over failed pages, failed pages over a case error ("complete" iff not partial)
-    stopped_reason = stopped or ("failed_pages" if failed_pages else "case_errors" if errors else
-                                 "unfinished_cases" if unfinished else "complete")
+    # one word for the run: a stop wins over failed pages, then cache misses, then a case error ("complete" iff not partial)
+    stopped_reason = stopped or ("failed_pages" if failed_pages else "cache_misses" if cache_only and not_cached else
+                                 "case_errors" if errors else "unfinished_cases" if unfinished else "complete")
     have_base = agents.baseline_dir is not None and Path(agents.baseline_dir).is_dir()
 
     # ---- preds.csv (case-id order, verdicts in rules_lite order, then OVERALL) ----
@@ -537,14 +562,14 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         "local_fallbacks": {"router_all_families": flags["router_fallbacks"], "grader_unsure": flags["grader_failures"],
                             "decision_abstain": flags["decision_failures"] + flags["decision_invalid"]},
         "iteration2_cases": sum(1 for c in finished if results[c]["iteration"] >= 2),
-        "roles": _roles(cache, list(llms.values()), flags, seconds),
+        "roles": roles, "not_cached": not_cached,
         "cache": {"hits": cache.hits, "misses": cache.misses, "put_failures": cache.put_failures},
         "prompt_versions": prompt_versions(), "LOCAL_SCOPE": sorted(LOCAL_SCOPE),
         "route_recall": {"covered": recall_c, "total": recall_t, "missed": sorted(missed)} if have_base else None,
         "route_recall_note": None if have_base else "no baseline cache: route recall not measured",
         "submission": {"written": allowed, "reason": why, "problems": problems},
         "preds_rows": len(preds),
-        "spend": None if budget is None else {"usd": _float(budget.spent_usd), "tokens_in": _int(budget.input_tokens),
+        "spend": None if budget is None else {"max_usd": budget.max_usd, "usd": _float(budget.spent_usd), "tokens_in": _int(budget.input_tokens),
                                               "tokens_out": _int(budget.output_tokens), "llm_calls": _int(budget.llm_calls)},
         "wall_seconds": round(time.perf_counter() - t_start, 3),
     }
@@ -579,10 +604,10 @@ def build_agents(a, data_dir: Path):
     """The real agents (CLI only; tests replace this function): MiniMax main and extractor models, the local llama.cpp model with no
     cloud fallback, the agent cache under the data dir, the competition's rules_lite and requirements, the baseline extraction cache.
     Building them makes no model call. Returns (agents, budget, metric or None)."""
+    disable_assessor_cache()                            # before any model exists
     from assessor.llm import LLM
-    from assessor.tracing import Budget
 
-    budget = Budget(max_usd=a.max_usd, max_seconds=0, max_tokens=0, max_tool_calls=0)     # wall time and tokens are not capped
+    budget = make_budget(a.max_usd)
     main_llm, reader = LLM(budget=budget), LLM.extractor(budget=budget)
     if main_llm.mock_mode or reader.mock_mode:
         raise SystemExit("main or extractor model is on the mock provider: the cache is keyed by model, so set the real provider "
@@ -599,7 +624,7 @@ def build_agents(a, data_dir: Path):
     return ag, budget, metric
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m vendor_verdict", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -615,9 +640,16 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--engine", choices=["plain", "langgraph"], default="plain")
     r.add_argument("--ablate", default="", help="comma-separated: " + ",".join(sorted(ABLATIONS)))
     r.add_argument("--workers", type=int, default=6, help="cases in parallel (nodes stay sequential inside a case)")
-    r.add_argument("--max-usd", type=float, default=5.0, help="hard cap on spend at the configured prices (a run that hits it is partial)")
+    r.add_argument("--max-usd", type=float, default=None,
+                   help="optional cap on spend at the configured prices; default: no cap. A run that hits it stops as partial "
+                        "(stopped_reason budget). The cap is checked after the provider answers, so the call that crosses it is "
+                        "paid for and never cached.")
     r.add_argument("--out", default="")
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    a = build_parser().parse_args(argv)
 
     data_dir = Path(a.data)
     ablate = parse_ablate(a.ablate)

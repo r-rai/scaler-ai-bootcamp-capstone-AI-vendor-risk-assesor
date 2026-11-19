@@ -616,3 +616,89 @@ def test_resume_into_the_same_out_overwrites(tmp_path):
     assert rj["roles"]["planner"]["cache_hits"] >= 1 and len(preds(again)) == 3 * (len(REQS) + 1)
     assert (again / "submission.csv").exists() and sorted(p.name for p in (again / "traces").iterdir()) == \
         sorted(f"{c}.{e}" for c in CASE_IDS for e in ("json", "md"))
+
+
+# ---------------------------------------------------------------- fix round 1
+def test_a_cache_only_run_with_local_misses_is_partial(tmp_path, monkeypatch):
+    # I1: a grader prompt change after the filling run: every grade is a cache-only miss ("unsure"), no page fails
+    a = run_fixture(tmp_path / "a")
+    from vendor_verdict.agents import grader as grader_agent
+    monkeypatch.setattr(grader_agent, "GRADER_SYSTEM", grader_agent.GRADER_SYSTEM + " (edited)")
+    b = run_fixture(tmp_path / "b", cache_only=True, cache_from=a)
+    rj = run_json(b)
+    assert rj["roles"]["grader"]["not_cached"] > 0 and rj["pages_failed"] == 0
+    assert rj["partial"] is True and "cache_misses" in rj["partial_reasons"] and rj["stopped_reason"] == "cache_misses"
+    assert rj["not_cached"] == sum(rj["roles"][r]["not_cached"] for r in ("planner", "specialist", "router", "grader", "decision_maker"))
+    assert not (b / "submission.csv").exists() and rj["submission"]["written"] is False
+
+
+def test_a_complete_cache_only_run_has_no_cache_misses(tmp_path):
+    a = run_fixture(tmp_path / "a")
+    rj = run_json(run_fixture(tmp_path / "b", cache_only=True, cache_from=a))
+    assert rj["not_cached"] == 0 and rj["stopped_reason"] == "complete" and rj["submission"]["written"] is True
+
+
+class _EnabledCache:
+    """Stands in for the assessor's on-disk LLM cache (never touched: the test only checks it is replaced)."""
+    enabled = True
+
+
+def test_run_turns_the_assessor_llm_cache_off(tmp_path, monkeypatch):
+    import assessor.cache as acache
+    monkeypatch.setattr(acache, "_CACHE", _EnabledCache())
+    run_fixture(tmp_path)
+    assert isinstance(acache.get_cache(), acache.NullCache)
+
+
+def test_build_agents_turns_the_assessor_llm_cache_off_before_any_model_exists(tmp_path, monkeypatch):
+    import assessor.cache as acache
+    import assessor.llm as allm
+    monkeypatch.setattr(acache, "_CACHE", _EnabledCache())
+    seen = []
+
+    class FakeLLM:                                   # never a real LLM: records the process cache, then reports mock mode
+        mock_mode, model = True, "fake"
+
+        def __init__(self, *a, **k):
+            seen.append(acache.get_cache())
+
+        @classmethod
+        def extractor(cls, *a, **k):
+            return cls()
+    monkeypatch.setattr(allm, "LLM", FakeLLM)
+    args = runner.build_parser().parse_args(["run", "--split", "test", "--subset", "all"])
+    with pytest.raises(SystemExit):
+        runner.build_agents(args, tmp_path)
+    assert seen and all(isinstance(c, acache.NullCache) for c in seen)
+
+
+class ChargingReader(ReaderLLM):
+    """Charges a real Budget for every call, at the configured prices, as LLM._account does."""
+
+    def __init__(self, budget, **kw):
+        super().__init__(**kw)
+        self.budget = budget
+
+    def structured(self, system, user, schema, stage="", **kw):
+        out = super().structured(system, user, schema, stage=stage, **kw)
+        self.budget.charge(200_000_000, 0, model=self.model, role="main", stage=stage)    # tens of USD per call at any real price
+        return out
+
+
+def test_no_money_cap_by_default(tmp_path):
+    budget = runner.make_budget(None)
+    out = run_fixture(tmp_path, reader=ChargingReader(budget), budget=budget)
+    rj = run_json(out)
+    assert rj["spend"]["usd"] > 5 and rj["partial"] is False and rj["stopped_reason"] == "complete"
+
+
+def test_an_explicit_money_cap_still_stops_the_run(tmp_path):
+    budget = runner.make_budget(1.0)
+    rj = run_json(run_fixture(tmp_path, reader=ChargingReader(budget), budget=budget, workers=1))
+    assert rj["stopped"] == "budget" and rj["stopped_reason"] == "budget" and rj["partial"] is True
+
+
+def test_max_usd_defaults_to_no_cap():
+    a = runner.build_parser().parse_args(["run", "--split", "test", "--subset", "all"])
+    assert a.max_usd is None and runner.make_budget(None).max_usd == float("inf")
+    assert runner.build_parser().parse_args(["run", "--split", "test", "--subset", "all", "--max-usd", "2.5"]).max_usd == 2.5
