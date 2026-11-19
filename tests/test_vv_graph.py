@@ -112,9 +112,10 @@ class ReaderLLM:
     requested fields for every page given, with `iter2` values overriding by field."""
     model = "stub-reader"
 
-    def __init__(self, fail_pages=(), iter2=None, raise_exc=None, extra=None, iter2_extra=None):
+    def __init__(self, fail_pages=(), iter2=None, raise_exc=None, extra=None, iter2_extra=None, fail_iter2=False):
         self.calls, self.fail_pages, self.iter2, self.raise_exc, self.extra = [], set(fail_pages), iter2 or {}, raise_exc, extra or {}
         self.iter2_extra = iter2_extra or {}           # family -> raw items added to every iteration-2 answer (any page_id)
+        self.fail_iter2 = fail_iter2                   # every iteration-2 case read fails (iteration 1 succeeds)
 
     def structured(self, system, user, schema, stage="", **kw):
         assert schema is SpecialistRaw
@@ -125,7 +126,7 @@ class ReaderLLM:
             fields = user.split("\n", 1)[0][len("Report only these fields: "):].split(", ")
             pids = [line[len("page_id: "):] for line in user.split("\n") if line.startswith("page_id: ")]
             self.calls.append({"iteration": 2, "family": family, "pages": pids, "fields": fields})
-            if self.fail_pages & set(pids):
+            if self.fail_iter2 or self.fail_pages & set(pids):
                 raise LLMError("provider error 500 " + CANARY)
             out = []
             for pid in pids:
@@ -460,8 +461,8 @@ def test_a_specialist_failure_on_one_page_is_counted_and_the_case_finishes():
 
 def test_flags_start_at_zero():
     s = run_plain(new_state(CASE, PAGES), make_ag())
-    assert s["flags"] == {"planner_failures": 0, "router_fallbacks": 0, "specialist_failures": 0, "grader_failures": 0,
-                          "decision_failures": 0}
+    assert s["flags"] == {"planner_failures": 0, "router_fallbacks": 0, "specialist_failures": 0, "case_read_failures": 0,
+                          "grader_failures": 0, "decision_failures": 0, "decision_invalid": 0}
 
 
 def test_planner_failure_is_counted_and_routing_still_covers_the_pages():
@@ -545,3 +546,67 @@ def test_every_handover_has_seconds_and_only_counts_and_ids():
         assert isinstance(h["seconds"], float) and h["seconds"] >= 0
         assert h["to"] in NODE_ORDER + ["end"]
     assert s["trace"].to_json()["handovers"][-1]["agent"] == "audit"
+
+
+# ---------------------------------------------------------------- Task 8A follow-ups (ruling R32: M1, M2, M4, M5, M6)
+def test_an_iteration_2_case_read_failure_is_its_own_count_and_iteration_1_stands():
+    reader = ReaderLLM(fail_iter2=True)
+    s = run_plain(new_state(CASE, PAGES), make_ag(grade="unsure", reader=reader))
+    second = [c for c in reader.calls if c["iteration"] == 2]
+    assert s["iteration"] == 2 and len(second) == len(FAMILIES)
+    assert s["flags"]["case_read_failures"] == len(second) and s["flags"]["specialist_failures"] == 0
+    assert not any(n.startswith(nodes.FAILED_PAGE_NOTE) for n in s["notes"])         # no page counts as failed: iteration 1 read them
+    assert [n for n in s["notes"] if n.startswith("specialists: case read failed: ")] == \
+        [f"specialists: case read failed: {f}" for f in FAMILIES]
+    spec = [h for h in s["trace"].to_json()["handovers"] if h["agent"] == "specialists"]
+    assert [h["summary"]["failed_pages"] for h in spec] == [[], []] and spec[1]["summary"]["case_read_failures"] == len(second)
+    assert {r["iteration"] for r in s["readings"]} == {1}
+    assert set(s["facts"]) == set(READ_FIELDS) and all(s["verdicts"][f"R-{f}"] == "PASS" for f in READ_FIELDS)
+
+
+def test_case_read_notes_are_labelled_by_iteration_not_by_page_count():
+    # the planner sends data to p2 alone and the router tags every page with certifications only: data has ONE routed page in
+    # iteration 2, so a page-count proxy would label its case-read notes with the page id
+    spoof = [{"page_id": "p9", "field": "dpa_available", "value": "no", "quote": "x"}]
+    reader = ReaderLLM(iter2_extra={"data": spoof})
+    planner = PlannerLLM()
+    planner.structured = lambda system, user, schema, stage="", **kw: PlanOut(routes=[
+        PageRoute(page_id="p1", families=["access_incidents", "ai"]), PageRoute(page_id="p2", families=["data"])])
+    s = run_plain(new_state(CASE, PAGES), make_ag(grade="unsure", reader=reader, planner=planner, families=["certifications"]))
+    data_read = next(c for c in reader.calls if c["iteration"] == 2 and c["family"] == "data")
+    assert len(data_read["pages"]) == 1
+    dropped = [n for n in s["notes"] if "is not one of the pages read" in n]
+    assert dropped and all(n.startswith("specialists: data: case read: ") for n in dropped)
+
+
+def test_decide_conflicts_node_abstains_on_an_out_of_range_choice(with_baseline):
+    base_dir, _ = with_baseline(baseline_of(changes={"sso_saml": "none"}))
+    s = run_plain(new_state(CASE, PAGES), make_ag(baseline_dir=base_dir))
+    ag7 = make_ag(baseline_dir=base_dir, choice=7)
+    s.update(flags={k: 0 for k in nodes.FLAG_KEYS}, notes=[], decisions={}, conflicts=[])
+    out = nodes.decide_conflicts(s, ag7)
+    assert out["decisions"] == {"p1:sso_saml": None}
+    assert out["flags"]["decision_invalid"] == 1 and out["flags"]["decision_failures"] == 0
+    s.update(out)
+    assert nodes.merge(s, ag7)["facts"]["sso_saml"]["value"] == "all_plans"            # abstain -> the default (iteration-1) reading
+
+
+def test_decision_failures_and_invalid_answers_are_counted_apart(with_baseline):
+    base_dir, _ = with_baseline(baseline_of(changes={"sso_saml": "none"}))
+    failed = run_plain(new_state(CASE, PAGES), make_ag(baseline_dir=base_dir, raise_on={"decision"}))
+    assert failed["flags"]["decision_failures"] == 1 and failed["flags"]["decision_invalid"] == 0
+    invalid = run_plain(new_state(CASE, PAGES), make_ag(baseline_dir=base_dir, choice=7))
+    assert invalid["flags"]["decision_failures"] == 0 and invalid["flags"]["decision_invalid"] == 1
+
+
+def test_both_engines_share_the_step_bound(monkeypatch):
+    from vendor_verdict import graph as graph_mod
+    assert build_langgraph(AG).config["recursion_limit"] == graph_mod._MAX_STEPS
+    monkeypatch.setattr(graph_mod, "next_after_evaluate", lambda state: "specialists")         # an evaluator that never stops
+    a, b = new_state(CASE, PAGES), new_state(CASE, PAGES)
+    with pytest.raises(RuntimeError):                   # "unsure": iteration 2 is reached, after which a pass reads nothing new
+        run_plain(a, make_ag(grade="unsure"))
+    from langgraph.errors import GraphRecursionError
+    with pytest.raises(GraphRecursionError):
+        build_langgraph(make_ag(grade="unsure")).invoke(b)
+    assert len(a["trace"].to_json()["handovers"]) == len(b["trace"].to_json()["handovers"]) == graph_mod._MAX_STEPS

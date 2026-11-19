@@ -50,7 +50,8 @@ def run_plain(state: CaseState, ag: Agents) -> CaseState:
 
 
 def build_langgraph(ag: Agents):
-    """The same nodes and edges as a compiled LangGraph `StateGraph` (no checkpointer)."""
+    """The same nodes and edges as a compiled LangGraph `StateGraph` (no checkpointer), with the same step bound as `run_plain`
+    (LangGraph's `recursion_limit` counts node runs exactly as `run_plain` counts steps)."""
     from langgraph.graph import END, START, StateGraph
 
     g = StateGraph(CaseState)
@@ -62,7 +63,7 @@ def build_langgraph(ag: Agents):
             g.add_edge(a, b)
     g.add_conditional_edges(LOOP_NODE, next_after_evaluate, LOOP_BRANCHES)
     g.add_edge(NODE_ORDER[-1], END)
-    return g.compile()
+    return g.compile().with_config(recursion_limit=_MAX_STEPS)
 
 
 def mermaid(ag: Agents) -> str:

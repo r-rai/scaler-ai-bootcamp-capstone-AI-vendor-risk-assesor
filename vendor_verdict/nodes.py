@@ -11,8 +11,10 @@ Models: `plan` uses `ag.main_llm`; the specialists use `ag.reader_llm`; the rout
 the caller must make local-only (no cloud fallback: the runner's job).
 
 Failure handling: a failed local or MiniMax call never stops a case. It is counted in `flags`:
-    planner_failures, router_fallbacks (page tagged with every family), specialist_failures (failed calls; the failed page ids are in
-    `notes` as "specialists: failed page <id>" and in the trace), grader_failures (graded "unsure"), decision_failures (abstained).
+    planner_failures, router_fallbacks (page tagged with every family), specialist_failures (failed ITERATION-1 calls; the failed page
+    ids are in `notes` as "specialists: failed page <id>" and in the trace), case_read_failures (failed iteration-2 case reads, noted
+    as "specialists: case read failed: <family>"; the iteration-1 readings stand, so no page counts as failed), grader_failures
+    (graded "unsure"), decision_failures (a failed call, abstained), decision_invalid (an answer outside the candidates, abstained).
 `BudgetExceeded` always propagates.
 
 Trace: every node calls `state["trace"].handover` exactly once per execution, with counts, ids, field and family names and verdict labels
@@ -40,8 +42,11 @@ from .safe import safe_id
 from .state import CaseState
 
 ABLATIONS: frozenset[str] = frozenset({"router", "grader", "decision_maker", "iteration2"})
-FLAG_KEYS = ("planner_failures", "router_fallbacks", "specialist_failures", "grader_failures", "decision_failures")
-FAILED_PAGE_NOTE = "specialists: failed page "        # + a page id: the runner reads the failed pages from these notes
+FLAG_KEYS = ("planner_failures", "router_fallbacks", "specialist_failures", "case_read_failures", "grader_failures", "decision_failures",
+             "decision_invalid")
+FAILED_PAGE_NOTE = "specialists: failed page "        # + a page id: the runner reads the failed pages from these notes (iteration 1 only)
+CASE_READ_FAILED_NOTE = "specialists: case read failed: "    # + a family: a failed iteration-2 case read
+_INVALID_DECISION = "decision outside the candidates"    # decision_maker.decide's note for an answer outside the candidates
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,20 +169,28 @@ def specialists(state: CaseState, ag: Agents) -> dict:
     readings = list(state.get("readings") or [])
     taken = {r["id"] for r in readings}
     notes: list[str] = []
-    calls = failures = new_count = 0
+    calls = failures = case_read_failures = new_count = 0
     failed_pages: list[str] = []
+    failed_families: list[str] = []
 
     def take(new: list[dict], call_notes: list[str], pids: list[str], family: str) -> None:
-        nonlocal calls, failures, new_count
+        nonlocal calls, failures, case_read_failures, new_count
         calls += 1
         assert_unique_ids(new, taken)
         taken.update(r["id"] for r in new)
         readings.extend(new)
         new_count += len(new)
-        if any(n.startswith("failed") for n in call_notes):
-            failures += 1
-            failed_pages.extend(p for p in pids if p not in failed_pages)
-        notes.extend(f"{family}: {safe_id(pids[0]) if len(pids) == 1 else 'case read'}: {n}" for n in call_notes)
+        failed = any(n.startswith("failed") for n in call_notes)
+        if iteration == 1:
+            notes.extend(f"{family}: {safe_id(pids[0])}: {n}" for n in call_notes)
+            if failed:
+                failures += 1
+                failed_pages.extend(p for p in pids if p not in failed_pages)
+        else:                    # a failed case read leaves the iteration-1 readings standing: counted on its own, no page failed
+            notes.extend(f"{family}: case read: {n}" for n in call_notes)
+            if failed:
+                case_read_failures += 1
+                failed_families.append(family)
 
     for family, fields in FAMILIES.items():
         fam_pages = [pid for pid in routes.get(family, []) if pid in pages]
@@ -195,10 +208,12 @@ def specialists(state: CaseState, ag: Agents) -> dict:
     order = list(pages)
     failed_pages.sort(key=lambda p: order.index(p) if p in order else len(order))
     notes += [f"failed page {safe_id(p)}" for p in failed_pages]
+    notes += [CASE_READ_FAILED_NOTE[len("specialists: "):] + f for f in failed_families]
     _handover(state, "specialists", "grade_evidence", t0, iteration=iteration, calls=calls, readings=new_count,
-              failures=failures, failed_pages=[safe_id(p) for p in failed_pages], targets=sorted(targets) if iteration > 1 else [])
+              failures=failures, failed_pages=[safe_id(p) for p in failed_pages], case_read_failures=case_read_failures,
+              targets=sorted(targets) if iteration > 1 else [])
     return {"readings": readings, "notes": _notes(state, "specialists", notes),
-            "flags": _flags(state, specialist_failures=failures)}
+            "flags": _flags(state, specialist_failures=failures, case_read_failures=case_read_failures)}
 
 
 def grade_evidence(state: CaseState, ag: Agents) -> dict:
@@ -261,12 +276,14 @@ def decide_conflicts(state: CaseState, ag: Agents) -> dict:
             decisions[c["id"]] = None
             continue
         decisions[c["id"]] = decision_maker.decide(ag.local_llm, ag.cache, c, pages.get(c["page_id"]), notes)
-    failures = len(notes)                        # decide adds a note only for a failed call or an invalid index (both abstain)
+    # decide adds one note per failed call or invalid index (both abstain); its fixed phrase tells the two apart
+    invalid = sum(1 for n in notes if _INVALID_DECISION in n)
+    failures = len(notes) - invalid
     _handover(state, "decide_conflicts", "merge", t0, conflicts=len(conflicts),
               chosen=sum(1 for d in decisions.values() if d is not None), abstained=sum(1 for d in decisions.values() if d is None),
-              failures=failures, ablated="decision_maker" in ag.ablate)
+              failures=failures, invalid=invalid, ablated="decision_maker" in ag.ablate)
     return {"conflicts": conflicts, "decisions": decisions, "notes": _notes(state, "decide_conflicts", notes),
-            "flags": _flags(state, decision_failures=failures)}
+            "flags": _flags(state, decision_failures=failures, decision_invalid=invalid)}
 
 
 def merge(state: CaseState, ag: Agents) -> dict:
