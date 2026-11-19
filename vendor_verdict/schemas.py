@@ -3,16 +3,16 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 
 
 class FieldReading(BaseModel):
     """One statement a Field Specialist read on one page. `value` follows the rules_lite shape for `field`; for a list-valued
     field (certifications, subprocessors, incidents) it is one item object. `quote` is the verbatim page text it rests on."""
-    page_id: str
+    page_id: str = ""         # empty for a single-page read; the caller forces the page's own id
     field: str
     value: Any
-    quote: str
+    quote: str = Field(min_length=1)
 
 
 class SpecialistOut(BaseModel):
@@ -37,4 +37,6 @@ class GradeOut(BaseModel):
 
 
 class DecisionOut(BaseModel):
-    choice: int | None        # index into the numbered candidate list; None = abstain
+    # Index into the numbered candidate list; None = abstain. Strict: no bool/str/float coercion, no negative index
+    # (the caller checks the upper bound against its own candidate list).
+    choice: StrictInt | None = Field(..., ge=0)
