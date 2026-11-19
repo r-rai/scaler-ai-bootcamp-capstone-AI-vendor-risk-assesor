@@ -1,28 +1,47 @@
 """The handover trace of one case: which agent passed what to which agent, with tokens and seconds.
 
-Summaries hold counts and ids only, never page text: `handover` refuses a free-text value, so a trace can be printed,
-committed and shown in a presentation without leaking competition text."""
+Summaries are meant to hold counts and ids only, never page text. `handover` enforces that on a best-effort basis and never
+raises: a string longer than MAX_SUMMARY_STR is replaced by a `<text:N chars>` placeholder and an odd type is coerced or replaced
+by a `<TypeName>` placeholder, so a stray model-derived value can neither leak competition text into a trace nor crash a run.
+This is a heuristic, not a guarantee: a short quote still passes."""
 from __future__ import annotations
 
+import enum
+import numbers
+import os
 import threading
+from decimal import Decimal
 
-MAX_SUMMARY_STR = 80        # longest string a summary may hold: ids and field names fit, a quote or a sentence does not
+MAX_SUMMARY_STR = 80        # longest string a summary keeps as is: ids and field names fit, a quote or a sentence does not
+_MAX_DEPTH = 6              # deeper nesting (or a self-referencing container) is cut off
 
 
-def _check(value, path: str):
-    """A JSON-safe copy of `value`, or ValueError if it holds a string too long to be an id."""
-    if value is None or isinstance(value, (bool, int, float)):
+def _clean_str(text: str) -> str:
+    return text if len(text) <= MAX_SUMMARY_STR else f"<text:{len(text)} chars>"
+
+
+def _clean(value, depth: int = 0):
+    """A JSON-safe copy of `value` that holds no long string. Never raises for any value a caller can pass."""
+    if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        if len(value) > MAX_SUMMARY_STR:
-            raise ValueError(f"trace summary {path}: a string of {len(value)} characters looks like free text (counts and ids only)")
-        return value
+        return _clean_str(value)
+    if isinstance(value, numbers.Integral):                      # int, numpy integers
+        return int(value)
+    if isinstance(value, (numbers.Real, Decimal)):               # float, numpy floats, Decimal
+        return float(value)
+    if isinstance(value, os.PathLike):
+        return _clean_str(os.fspath(value))
+    if isinstance(value, enum.Enum):
+        return _clean(value.value, depth + 1)
+    if depth >= _MAX_DEPTH:
+        return "<nested>"
     if isinstance(value, (list, tuple, set, frozenset)):
         items = sorted(value, key=str) if isinstance(value, (set, frozenset)) else value
-        return [_check(v, f"{path}[{i}]") for i, v in enumerate(items)]
+        return [_clean(v, depth + 1) for v in items]
     if isinstance(value, dict):
-        return {str(k): _check(v, f"{path}.{k}") for k, v in value.items()}
-    raise ValueError(f"trace summary {path}: unsupported type {type(value).__name__}")
+        return {_clean_str(str(k)): _clean(v, depth + 1) for k, v in value.items()}
+    return f"<{type(value).__name__}>"
 
 
 class Trace:
@@ -31,14 +50,18 @@ class Trace:
         self._handovers: list[dict] = []
         self._lock = threading.Lock()                    # parallel specialists record into the same trace
 
-    def __getstate__(self) -> dict:                      # the state dict is copied and checkpointed by the LangGraph engine; a Lock cannot be
+    def __getstate__(self) -> dict:                      # a Lock can be neither deep-copied nor pickled: leave it out and rebuild it
         return {"case_id": self.case_id, "_handovers": self._handovers}
 
     def __setstate__(self, state: dict) -> None:
         self.case_id, self._handovers, self._lock = state["case_id"], state["_handovers"], threading.Lock()
 
     def handover(self, agent: str, to: str, summary: dict, tokens_in: int = 0, tokens_out: int = 0, seconds: float = 0.0) -> None:
-        record = {"agent": agent, "to": to, "summary": _check(summary, "summary"),
+        try:
+            clean = _clean(summary)
+        except Exception:                                # a summary that cannot even be read must not fail the node that made it
+            clean = {"summary": "<unrecordable>"}
+        record = {"agent": agent, "to": to, "summary": clean,
                   "tokens_in": tokens_in, "tokens_out": tokens_out, "seconds": seconds}
         with self._lock:
             self._handovers.append(record)

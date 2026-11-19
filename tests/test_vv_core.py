@@ -2,10 +2,15 @@
 
 Invented data only: no competition file is read and no LLM is called."""
 import copy
+import enum
 import json
 import pickle
 import re
+import threading
+from decimal import Decimal
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 from vendor_verdict import data
@@ -109,6 +114,50 @@ def test_cache_treats_a_corrupt_entry_as_a_miss(tmp_path):
     assert c.get(k) is None and (c.hits, c.misses) == (0, 1)
 
 
+def test_cache_key_is_unchanged_for_ordinary_text_and_survives_lone_surrogates(tmp_path):
+    c = CallCache(tmp_path)
+    # digests taken from the first implementation (commit 092fc8b): existing cache entries must stay reachable
+    assert c.key("specialist", "v1", "m", "payload") == "40701dad3ead85e27c242a62594020a23047dd13186d5348ab5b334e5020d759"
+    assert c.key("specialist", "v1", "m", "payload", "s1") == "92d23bbec6988f535170cb1ac863c90eb20072d1b38526b8310c6ca031ef273d"
+    assert c.key("r", "v", "naïve", "päyload ✓") == "04f9aee02b9570b1c741c3b879d983daa32fcde7f5a606702a3ba451a3939fe2"
+    k = c.key("r", "v", "m", "bad \ud800 payload")
+    assert re.fullmatch(r"[0-9a-f]{64}", k) and k == c.key("r", "v", "m", "bad \ud800 payload")
+    assert k != c.key("r", "v", "m", "bad  payload")
+    assert re.fullmatch(r"[0-9a-f]{64}", c.key("r\udfff", "v", "m", "p", "salt\ud800"))
+
+
+def test_cache_put_stores_a_lone_surrogate_payload_and_get_reads_it_back(tmp_path):
+    c = CallCache(tmp_path); k = c.key("r", "v", "m", "p")
+    c.put(k, {"out": "bad \ud800 text", "ok": "naïve"})                 # no UnicodeEncodeError
+    assert list(tmp_path.glob("*.tmp")) == [] and c.put_failures == 0
+    assert c.get(k) == {"out": "bad \ud800 text", "ok": "naïve"}
+
+
+def test_cache_put_never_raises_leaves_no_tmp_and_counts_the_failure(tmp_path, monkeypatch):
+    c = CallCache(tmp_path); assert c.put_failures == 0
+    c.put(c.key("r", "v", "m", "a"), {"out": object()})                 # not JSON-serialisable
+    assert c.put_failures == 1 and list(tmp_path.iterdir()) == []
+
+    def disk_full(self, target):
+        raise OSError("disk full")
+    monkeypatch.setattr(Path, "replace", disk_full)                     # the temp file exists by now: it must be removed
+    assert c.put(c.key("r", "v", "m", "b"), {"out": 1}) is None
+    assert c.put_failures == 2 and list(tmp_path.iterdir()) == []
+
+
+def test_cache_put_into_an_unusable_root_counts_a_failure(tmp_path):
+    blocker = tmp_path / "not_a_folder"; blocker.write_text("x", encoding="utf-8")
+    c = CallCache(blocker / "agents")
+    assert c.put(c.key("r", "v", "m", "p"), {"out": 1}) is None and c.put_failures == 1
+
+
+def test_cache_put_failures_are_counted_exactly_under_threads(tmp_path):
+    c = CallCache(tmp_path)
+    threads = [threading.Thread(target=lambda: [c.put(c.key("r", "v", "m", "p"), {"out": object()}) for _ in range(25)]) for _ in range(8)]
+    [t.start() for t in threads]; [t.join() for t in threads]
+    assert c.put_failures == 200 and list(tmp_path.iterdir()) == []
+
+
 def test_cache_default_root_is_data_kaggle_cache_agents():
     assert CallCache().root.parts[-3:] == ("data_kaggle", "cache", "agents")
 
@@ -137,7 +186,7 @@ def test_trace_markdown_lists_each_handover_with_its_counts():
     assert "c9999" in md and "grader → decision_maker" in md and "conflicts=2" in md
 
 
-def test_trace_survives_copy_and_pickle_so_a_graph_engine_can_checkpoint_the_state():
+def test_trace_deepcopies_and_pickles():
     t = Trace("c9999"); t.handover("router", "specialist", {"pages": 4}, tokens_in=5)
     for clone in (copy.deepcopy(t), pickle.loads(pickle.dumps(t))):
         assert clone.to_json() == t.to_json()
@@ -145,13 +194,52 @@ def test_trace_survives_copy_and_pickle_so_a_graph_engine_can_checkpoint_the_sta
     assert len(t.to_json()["handovers"]) == 1                           # the clones are independent
 
 
-def test_trace_summaries_refuse_free_text():
+def test_trace_summaries_replace_free_text_with_a_placeholder_and_never_raise():
     t = Trace("c9999")
-    with pytest.raises(ValueError):
-        t.handover("specialist", "grader", {"quote": "This vendor stores customer tickets in the EU only, and " * 3})
-    with pytest.raises(ValueError):
-        t.handover("specialist", "grader", {"nested": {"deep": ["x" * 200]}})
-    assert t.to_json()["handovers"] == []                               # a refused handover leaves no record
+    sentence = "This vendor stores customer tickets in the EU only, and " * 3
+    t.handover("specialist", "grader", {"quote": sentence, "nested": {"deep": ["x" * 200, "p1"]}, "n": 3, "k" * 500: 1,
+                                        "edge_ok": "e" * 80, "edge_over": "e" * 81})
+    summary = t.to_json()["handovers"][0]["summary"]
+    assert summary["quote"] == f"<text:{len(sentence)} chars>"
+    assert summary["nested"] == {"deep": ["<text:200 chars>", "p1"]}
+    assert summary["n"] == 3 and summary["<text:500 chars>"] == 1
+    assert summary["edge_ok"] == "e" * 80 and summary["edge_over"] == "<text:81 chars>"
+    dumped = json.dumps(t.to_json())
+    assert sentence not in dumped and "x" * 81 not in dumped and "k" * 81 not in dumped
+    assert len(t.to_json()["handovers"]) == 1                           # the handover itself is still recorded
+
+
+def test_trace_summaries_coerce_odd_types_instead_of_raising():
+    class Colour(enum.Enum):
+        RED = "red"
+
+    cyclic: list = []
+    cyclic.append(cyclic)
+    t = Trace("c9999")
+    t.handover("a", "b", {"path": Path("runs/case"), "dec": Decimal("1.5"), "np_int": np.int64(7), "np_float": np.float32(0.5),
+                          "colour": Colour.RED, "obj": object(), "raw": b"abc", "tuple": (1, 2), "set": {"b", "a"},
+                          "none": None, "flag": True, "cycle": cyclic})
+    s = t.to_json()["handovers"][0]["summary"]
+    assert s["path"] == "runs/case" and s["dec"] == 1.5 and s["colour"] == "red"
+    assert s["np_int"] == 7 and type(s["np_int"]) is int and type(s["np_float"]) is float
+    assert s["obj"] == "<object>" and s["raw"] == "<bytes>"
+    assert s["tuple"] == [1, 2] and s["set"] == ["a", "b"] and s["none"] is None and s["flag"] is True
+    assert isinstance(s["cycle"], list)                                 # a self-referencing list is cut off, not recursed into forever
+    json.dumps(t.to_json())                                             # everything recorded is JSON-serialisable
+    assert "a → b" in t.to_markdown()
+
+
+def test_trace_handover_never_raises_even_for_a_summary_it_cannot_read():
+    class Broken(dict):
+        def items(self):
+            raise RuntimeError("boom")
+
+    t = Trace("c9999")
+    t.handover("a", "b", Broken(x=1), tokens_in=3)
+    t.handover("b", "c", {"dec": Decimal("sNaN")})                      # float(Decimal("sNaN")) raises ValueError
+    first, second = t.to_json()["handovers"]
+    assert first["summary"] == {"summary": "<unrecordable>"} and first["tokens_in"] == 3
+    assert second["summary"] == {"summary": "<unrecordable>"}
 
 
 # ------------------------------------------------------------------------------------------------ data
