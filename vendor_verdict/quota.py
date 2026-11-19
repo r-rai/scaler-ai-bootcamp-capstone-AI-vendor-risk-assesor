@@ -1,7 +1,7 @@
 """Quota-window resilience for the paid (hosted MiniMax) calls: detection, a clean stop, an optional wait, an exact resume.
 
 UNVERIFIED: the real wording of MiniMax's 5-hour quota-window error is not known. `is_quota_error` recognises a 429 (the status when
-it is known, else a whole-word "429" or "rate limit" in the message), and a best-guess keyword list (`QUOTA_KEYWORDS`, ONE constant);
+it is known, else, with no status or a 5xx (R41), a whole-word "429" or "rate limit" in the message), and a best-guess keyword list (`QUOTA_KEYWORDS`, ONE constant);
 a known non-quota 4xx status (`NON_QUOTA_STATUSES`) is never a quota error (ruling R39). None of this has been checked against a real
 MiniMax quota error. The first quota error's status, kind and clipped message are written to run.json (never to the console) so the
 real text can be read after a run and the list corrected.
@@ -56,6 +56,8 @@ class QuotaExhausted(BaseException):
 
 
 def _status(exc: BaseException) -> int | None:
+    # Only an int `status_code` along the `__cause__` chain counts: a string status or a `.status` attribute (another client) falls
+    # back to the status-less rules.
     seen = 0
     e: BaseException | None = exc
     while e is not None and seen < 5:                   # LLMError is raised `from` the SDK error, which carries the status
@@ -69,7 +71,8 @@ def _status(exc: BaseException) -> int | None:
 def is_quota_error(exc: BaseException) -> str | None:
     """"rate_limit", "keyword" or None (ruling R39: the HTTP status wins when it is known).
     - status 429 -> "rate_limit"; a status in NON_QUOTA_STATUSES -> None for both kinds;
-    - only when NO status is known: "429" as a whole word or "rate limit" (any case) in the message -> "rate_limit";
+    - only when NO status is known or it is a 5xx (ruling R41): "429" as a whole word or "rate limit" (any case) in the message ->
+      "rate_limit";
     - a QUOTA_KEYWORDS word (UNVERIFIED) in the lowercased message -> "keyword", only with no status, 402, 403 or a 5xx.
     Never for the runner's cache-only refusal or the repair-exhaustion error."""
     if type(exc).__name__ == "NotCached":
@@ -83,7 +86,9 @@ def is_quota_error(exc: BaseException) -> str | None:
     if status in NON_QUOTA_STATUSES:
         return None
     low = msg.lower()
-    if status is None and (_429.search(msg) or "rate limit" in low):
+    # R41: the text rule also holds on a 5xx (a transient overload worded "rate limit" keeps the retry ladder); a 4xx never gets here
+    # in NON_QUOTA_STATUSES and is excluded below (an oversized-page 400 quoting "14293 tokens" is not a rate limit)
+    if (status is None or 500 <= status <= 599) and (_429.search(msg) or "rate limit" in low):
         return "rate_limit"
     if (status is None or status in _KEYWORD_STATUSES or 500 <= status <= 599) and any(k in low for k in QUOTA_KEYWORDS):
         return "keyword"

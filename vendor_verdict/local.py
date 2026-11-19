@@ -15,7 +15,8 @@ start of a run that can pay, and the free Router-only pre-warm pass.
   window time (R34). A model without a llama.cpp target (a test stub) has nothing to check.
 - `prewarm` runs ONLY the Router over every readable page of the selected cases, through the limiter and the Router's own cache keys
   (`agents.router.tag_pages`, exactly as the graph's `route_pages` calls it), so a later run finds every routing in the cache. It makes
-  no hosted call and writes nothing but cache entries.
+  no hosted call and writes nothing but cache entries. Cases are submitted one by one; a Ctrl-C sets a stop event: the cases in flight
+  end at their next local call (`PrewarmStopped`), queued ones never start, the partial counts are printed and the exit is 130.
 
 Console lines are counts and fixed words only (never page text, a reply body or an exception message).
 """
@@ -34,6 +35,7 @@ from .agents import router
 from .cache import CallCache
 
 EXIT_LOCAL_DOWN = 69                                   # EX_UNAVAILABLE: the local server is down, nothing was started
+EXIT_INTERRUPTED = 130                                 # runner.EXIT_INTERRUPTED (this module cannot import the runner)
 LOCAL_ROLES = ("router", "grader", "decision_maker")
 HEALTH_TIMEOUT_S = 2.0
 # run.json `local.health`: ok | down_allowed (down, --allow-local-down) | skipped (no check needed: cache-only, no local role in use,
@@ -44,8 +46,9 @@ HEALTH_VALUES = ("ok", "down_allowed", "skipped", "not_checked")
 class LocalLimiter:
     """The local model behind one shared semaphore. Forwards every attribute (`model`, `targets`, `budget`, `tracer`, `mock_mode`)."""
 
-    def __init__(self, llm, slots: int = config.LOCAL_SLOTS, clock=time.perf_counter):
-        self._llm, self.slots, self._clock = llm, int(slots), clock
+    def __init__(self, llm, slots: int | None = None, clock=time.perf_counter):
+        # `config.LOCAL_SLOTS` is read here, not bound when the module is imported
+        self._llm, self.slots, self._clock = llm, int(config.LOCAL_SLOTS if slots is None else slots), clock
         self._sem = threading.BoundedSemaphore(self.slots)
         self._lock = threading.Lock()
         self.in_flight = 0
@@ -98,7 +101,9 @@ def limited(llm) -> LocalLimiter:
 
 
 def block(lim: LocalLimiter, health: str, prewarm: dict | None = None) -> dict:
-    """run.json `local`: {slots, health, calls, max_in_flight, wait_seconds, prewarm}."""
+    """run.json `local`: {slots, health, calls, max_in_flight, wait_seconds, prewarm}. Exact names (Task 9 reads them). `prewarm` is
+    reserved, always null in run.json (ruling 12e): the prewarm pass is a separate command that writes only the cache, and
+    `roles.router.cache_hits` carries the warm-cache signal."""
     return {"slots": lim.slots, "health": health, **lim.stats(), "prewarm": prewarm}
 
 
@@ -173,40 +178,85 @@ def start_check(llm, *, cache_only: bool, ablate, allow_down: bool, say=print, g
 
 
 # ------------------------------------------------------------------------------------------------ prewarm
-def prewarm(cases: dict, pages: dict, ids: list[str], lim: LocalLimiter, cache_root: Path, *, workers: int = config.LOCAL_SLOTS,
-            clock=time.perf_counter) -> dict:
-    """Route every readable page of `ids` with the local model only: {cases, pages, hits, calls, failures, seconds}. `pages` counts
-    the Router's page lookups (as the graph makes them), `hits` the cached routings, `calls` the new local calls, `failures` the
-    failed ones (never cached; the graph would tag those pages with every family)."""
+class PrewarmStopped(BaseException):
+    """The prewarm pass is stopping: the case in flight ends at its next local call. A BaseException, so the Router's
+    `except Exception` cannot count it as a failed page."""
+
+
+class _Stoppable:
+    """The limiter, refusing every call once `stop` is set."""
+
+    def __init__(self, lim: LocalLimiter, stop: threading.Event):
+        self._lim, self._stop = lim, stop
+
+    @property
+    def model(self):
+        return self._lim.model
+
+    def structured(self, *args, **kw):
+        if self._stop.is_set():
+            raise PrewarmStopped()
+        return self._lim.structured(*args, **kw)
+
+
+def prewarm(cases: dict, pages: dict, ids: list[str], lim: LocalLimiter, cache_root: Path, *, workers: int | None = None,
+            clock=time.perf_counter, stop: threading.Event | None = None) -> dict:
+    """Route every readable page of `ids` with the local model only: {cases, pages, hits, calls, failures, seconds}. `cases` and
+    `pages` count the fully routed cases and their Router page lookups (as the graph makes them), `hits` the cached routings, `calls`
+    the new local calls, `failures` the failed ones (never cached; the graph would tag those pages with every family). `workers`
+    defaults to `config.LOCAL_SLOTS`. Once `stop` is set (a Ctrl-C here sets it) no case starts and no further local call is made."""
     t0 = clock()
+    stop = stop if stop is not None else threading.Event()
     cache = CallCache(Path(cache_root))
     before = lim.stats()["calls"]
+    guarded = _Stoppable(lim, stop)
 
-    def one(cid: str) -> tuple[int, int]:
+    def one(cid: str) -> tuple[int, int] | None:
+        if stop.is_set():
+            return None                                 # never started
         recs = rk.triage(cases[cid], pages[cid])
-        _, failures = router.tag_pages(lim, cache, recs)
+        _, failures = router.tag_pages(guarded, cache, recs)
         return sum(1 for r in recs if rk.readable(r)), failures
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        got = list(pool.map(one, ids))
-    return {"cases": len(ids), "pages": sum(p for p, _ in got), "hits": cache.hits, "calls": lim.stats()["calls"] - before,
+    pool = ThreadPoolExecutor(max_workers=max(1, config.LOCAL_SLOTS if workers is None else workers))
+    futs = [pool.submit(one, cid) for cid in ids]     # one by one, so a stop can leave the queued cases unstarted
+    try:
+        for f in futs:
+            f.exception()                               # waits; a Ctrl-C lands here, on the main thread
+    except KeyboardInterrupt:
+        stop.set()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    got = []
+    for f in futs:
+        if f.cancelled():
+            continue
+        exc = f.exception()
+        if exc is not None and not isinstance(exc, PrewarmStopped):
+            raise exc                                   # a bug, as pool.map would have raised it
+        if exc is None and f.result() is not None:
+            got.append(f.result())
+    return {"cases": len(got), "pages": sum(p for p, _ in got), "hits": cache.hits, "calls": lim.stats()["calls"] - before,
             "failures": sum(f for _, f in got), "seconds": round(clock() - t0, 3)}
 
 
-def prewarm_cli(cases: dict, pages: dict, ids: list[str], ag, *, ablate=frozenset(), say=print, get=None) -> int:
-    """`run --prewarm-local`: the health check (a down server is exit EXIT_LOCAL_DOWN), then `prewarm`; 0 when done."""
+def prewarm_cli(cases: dict, pages: dict, ids: list[str], ag, *, ablate=frozenset(), say=print, get=None,
+                stop: threading.Event | None = None) -> int:
+    """`run --prewarm-local`: the run's health check (`start_check`, one wording; a down server is exit EXIT_LOCAL_DOWN), then
+    `prewarm`; 0 when done, EXIT_INTERRUPTED after a stop (a Ctrl-C, or `stop` set by the caller) with the partial counts."""
     if "router" in ablate or "router" not in config.LOCAL_SCOPE:
         say("prewarm: the router is ablated or not a local role: nothing to prewarm")
         return 0
     lim = limited(ag.local_llm)
-    url = health_url(lim)
-    if url is not None:
-        res = local_health(url, get=get)
-        if not res["ok"]:
-            say(f"local server health: DOWN ({res['detail']}); nothing prewarmed (exit {EXIT_LOCAL_DOWN})")
-            return EXIT_LOCAL_DOWN
-        say("local server health: ok")
-    p = prewarm(cases, pages, ids, lim, Path(ag.cache.root))
-    say(f"prewarm (router only, local; no hosted call): cases {p['cases']}, pages {p['pages']}, cache hits {p['hits']}, "
-        f"new calls {p['calls']}, failures {p['failures']}, {p['seconds']:.1f} s")
+    if start_check(lim, cache_only=False, ablate=ablate, allow_down=False, say=say, get=get) is None:
+        return EXIT_LOCAL_DOWN
+    stop = stop if stop is not None else threading.Event()
+    p = prewarm(cases, pages, ids, lim, Path(ag.cache.root), stop=stop)
+    counts = (f"pages {p['pages']}, cache hits {p['hits']}, new calls {p['calls']}, failures {p['failures']}, "
+              f"{p['seconds']:.1f} s")
+    if stop.is_set():
+        say(f"prewarm INTERRUPTED (router only, local; no hosted call): cases {p['cases']} of {len(ids)} routed, {counts}; "
+            f"exit {EXIT_INTERRUPTED} (the routed pages are cached: the same command again resumes)")
+        return EXIT_INTERRUPTED
+    say(f"prewarm (router only, local; no hosted call): cases {p['cases']}, {counts}")
     return 0

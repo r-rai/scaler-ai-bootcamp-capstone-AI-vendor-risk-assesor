@@ -6,12 +6,15 @@
     python -m vendor_verdict run ... --prewarm-local    # the Router only, on the local server: fills its cache, no hosted call
     python -m vendor_verdict selfcheck [--limit 3]      # dev cases through the real rules_lite, replay readers (vendor_verdict.selfcheck)
 
-Outputs in `--out` (default `reports/vendor_verdict/<split>_<subset>[_ablate-a+b][_salt-S]/`):
+Outputs in `--out` (default `reports/vendor_verdict/<split>_<subset>[_limit-N][_only-H][_ablate-a+b][_salt-S]/`, `default_out`; H is
+the first 8 hex digits of the sha1 of the sorted, comma-joined --only ids, never the ids, so a smoke run never shares a full run's dir):
 - `preds.csv` (id, verdict) for every finished case, in case-id order (never completion order), so a cache-only rerun is byte-identical;
 - `run.json`: counts only (see `run`); Task 9's gates read it, so its field names are a contract;
 - `traces/<case_id>.json` and `.md`; `graph.mmd`;
 - `submission.csv` only under `submission_rule` (ruling R4). It is never uploaded.
-Every earlier output in `--out` is removed when a run starts, so a stale submission can never sit next to a later partial run.
+Every earlier output in `--out` is removed when a run starts, so a stale submission can never sit next to a later partial run. Write
+order: the submission goes to a temp file first (its self-check needs the file), then run.json (atomically), then the temp file is
+renamed to submission.csv: a crash leaves at worst a run.json without its submission, never a submission without its run.json.
 
 Per-role accounting (cases run in parallel, so the global CallCache counters cannot be split by role):
 - `RoleCache` remembers the role of every key it mints (`key(role, ...)` is always called before `get`/`put` on that key), so cache
@@ -33,8 +36,10 @@ Local server (vendor_verdict.local): every local call takes one of `config.LOCAL
 pay and uses a local role checks `<server>/health` first and refuses to start when it is down, unless --allow-local-down.
 
 Exit status: 0 complete; 1 complete but the submission self-check found problems; 3 any other partial run (budget, failed pages,
-case errors, cache-only misses, unfinished cases); 69 (EX_UNAVAILABLE) the local server is down, nothing started (not retried by the
-loop below); 75 (EX_TEMPFAIL) a quota stop; 130 interrupted. To retry only quota stops:
+case errors, cache-only misses, unfinished cases); 64 (EX_USAGE) arguments refused (`cli.refusal`: a negative --limit, a non-finite
+or negative --max-usd, an unknown ablation, --only with no id or an unknown id, --prewarm-local with a conflicting option), nothing
+built, deleted or started; 69 (EX_UNAVAILABLE) the local server is down, nothing started (not retried by the loop below); 75
+(EX_TEMPFAIL) a quota stop; 130 interrupted (also a Ctrl-C during --prewarm-local). To retry only quota stops:
     while :; do python -m vendor_verdict run ...; rc=$?; [ $rc -eq 75 ] || break; sleep 600; done
 (`until ...; do sleep 600; done` would also loop on a deterministic partial run, exit 3, forever.)
 
@@ -45,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import numbers
@@ -68,7 +74,7 @@ from . import data as data_mod
 from . import local as local_mod
 from .agents import reviewer
 from .cache import CallCache
-from .cli import estimate, format_estimate      # the --estimate report (moved, R40)
+from .cli import EXIT_USAGE, estimate, format_estimate, only_ids, refusal      # the --estimate report and the refusals (R40)
 from .config import FAMILIES, LOCAL_SCOPE, ROOT
 from .graph import build_langgraph, mermaid, new_state, run_plain
 from .nodes import ABLATIONS, FAILED_PAGE_NOTE, FLAG_KEYS, Agents, _readable_pages
@@ -84,7 +90,7 @@ _NODE_ROLE = {"plan": "planner", "specialists": "specialist", "route_pages": "ro
 _FLAG_ROLE = {"planner_failures": "planner", "specialist_failures": "specialist", "case_read_failures": "specialist",
               "router_fallbacks": "router", "grader_failures": "grader", "decision_failures": "decision_maker",
               "decision_invalid": "decision_maker"}
-_OUTPUTS = ("submission.csv", "run.json", "preds.csv", "graph.mmd")
+_OUTPUTS = ("submission.csv", "run.json", "preds.csv", "graph.mmd", "submission.csv.tmp", "run.json.tmp")
 # Exceptions that mean "abandon this case, start no new case, finish cleanly" (the case writes no preds or trace); `_stop_name` gives
 # the run.json `stopped` / `stopped_reason` value of each. A QuotaExhausted reaches the runner only in STOP mode or when WAIT mode gave
 # up (the gate restarts the case otherwise).
@@ -126,7 +132,7 @@ def error_frames(exc: BaseException, limit: int = 12) -> list[str]:
 
 
 def previous_resume_count(out: Path) -> int:
-    """resume_count of a run into `out`: the earlier run.json's resume_count + 1, or 0 when there is none (unreadable: counts as 0)."""
+    """resume_count of a run into `out`: the earlier run.json's resume_count + 1, or 0 when there is none (unreadable: counts as 1)."""
     path = Path(out) / "run.json"
     if not path.exists():
         return 0
@@ -332,13 +338,29 @@ def submission_rule(split: str, salt: str, ablate, partial: bool, ids, test_case
     return True, "ok"
 
 
-def default_out(split: str, subset: str, ablate, salt: str) -> Path:
+def default_out(split: str, subset: str, ablate, salt: str, *, limit: int | None = None, only=None) -> Path:
+    """`reports/vendor_verdict/<split>_<subset>[_limit-N][_only-H][_ablate-a+b][_salt-S]` (the module docstring; Task 9's gates CLI
+    computes it here). A full run (no limit, no only) keeps its plain name; the --only ids are deduplicated and hashed, never written."""
     name = f"{split}_{subset}"
+    if limit and limit > 0:
+        name += f"_limit-{int(limit)}"
+    if only:
+        name += "_only-" + hashlib.sha1(",".join(sorted(set(only))).encode("utf-8")).hexdigest()[:8]
     if ablate:
         name += "_ablate-" + "+".join(sorted(ablate))
     if salt:
         name += "_salt-" + re.sub(r"[^A-Za-z0-9_.-]", "_", salt)
     return ROOT / "reports" / "vendor_verdict" / name
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """`text` into `path` through a temp file and a rename: a crash leaves the old file or the new one, never half of one."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _file_id(case_id: str) -> str:
@@ -447,7 +469,7 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         exc = fut.exception()
         if exc is None:
             results[cid] = fut.result()
-        elif not isinstance(exc, (*STOP_EXCEPTIONS, QuotaExhausted, KeyboardInterrupt, RunStopped)):
+        elif not isinstance(exc, (*STOP_EXCEPTIONS, KeyboardInterrupt, RunStopped)):     # STOP_EXCEPTIONS holds QuotaExhausted
             errors[cid] = type(exc).__name__            # a bug in one case: counted by class name only, the other cases go on
             frames[cid] = error_frames(exc)             # and located by its repo frames (path:line, never the message)
     if gate.stopped and stopped is None:
@@ -514,10 +536,15 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         test_ids = {r["case_id"] for r in test_rows}
     allowed, why = submission_rule(split, ag.salt, ag.ablate, partial, ids, test_ids)
     problems: list[str] = []
+    sub_tmp = out / "submission.csv.tmp"                # renamed only after run.json is written (the module docstring)
     if allowed:
         if metric is None:
             metric = rk.load_module("kaggle_metric", data_dir / "metric.py")
-        problems = rk.write_submission(out / "submission.csv", test_rows, preds, metric)
+        try:
+            problems = rk.write_submission(sub_tmp, test_rows, preds, metric)
+        except BaseException:
+            sub_tmp.unlink(missing_ok=True)
+            raise
 
     rj = {
         "split": split, "subset": subset, "engine": engine, "workers": max(1, workers), "limit": limit,
@@ -548,7 +575,12 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         "local": local_mod.block(lim, local_health),
         "wall_seconds": round(time.perf_counter() - t_start, 3),
     }
-    (out / "run.json").write_text(_dump(rj), encoding="utf-8")
+    try:
+        _write_atomic(out / "run.json", _dump(rj))
+        if allowed:
+            sub_tmp.replace(out / "submission.csv")
+    finally:
+        sub_tmp.unlink(missing_ok=True)
 
     say(f"finished {len(finished)}/{len(ids)} cases (pending {len(unfinished)}, errors {len(errors)}); readable pages {readable}, read {rj['pages_read']}, failed {len(failed_pages)}, "
         f"unrouted {unrouted}; failures {rj['failures']}; iteration-2 cases {rj['iteration2_cases']}")
@@ -616,7 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--split", choices=["train", "test"], required=True)
     r.add_argument("--subset", choices=["all", "dev", "holdout"], required=True)
     r.add_argument("--limit", type=int, default=0)
-    r.add_argument("--only", default="", help="comma-separated case ids")
+    r.add_argument("--only", default=None, help="comma-separated case ids (each must be a case of --split/--subset)")
     r.add_argument("--cache-only", action="store_true", help="never call a model: a cache miss is a failed call")
     r.add_argument("--estimate", action="store_true", help="print calls and tokens per role, then exit before any model call")
     r.add_argument("--salt", default="", help="an independent sample of the same inputs; never a submission")
@@ -649,8 +681,12 @@ def main(argv: list[str] | None = None, *, http_get=None) -> int:
         return selfcheck.main(a)
 
     data_dir = Path(a.data)
+    why = refusal(a, data_dir)
+    if why is not None:
+        print(f"refused (exit {EXIT_USAGE}): {why}", file=sys.stderr)
+        return EXIT_USAGE                               # before build_agents: nothing built, deleted or started
     ablate = parse_ablate(a.ablate)
-    only = [c for c in a.only.split(",") if c] or None
+    only = only_ids(a.only)
     ag, budget, metric = build_agents(a, data_dir)
     print(f"models: main {ag.main_llm.model}, reader {ag.reader_llm.model}, local {ag.local_llm.model}; baseline {ag.baseline_model}")
     if a.estimate:
@@ -659,15 +695,13 @@ def main(argv: list[str] | None = None, *, http_get=None) -> int:
             print(line)
         print("local server health: skipped (--estimate: no model call)")
         return 0
-    if a.prewarm_local and a.cache_only:
-        raise SystemExit("--prewarm-local makes local calls: it cannot be combined with --cache-only")
     if a.prewarm_local:
         cases, pages, ids = load_split(data_dir, a.split, a.subset, a.limit or None, only)
         return local_mod.prewarm_cli(cases, pages, sorted(ids), ag, ablate=ablate, say=print, get=http_get)
     health = local_mod.start_check(ag.local_llm, cache_only=a.cache_only, ablate=ablate, allow_down=a.allow_local_down, get=http_get)
     if health is None:
         return EXIT_LOCAL_DOWN                          # before run(): nothing started, no earlier output removed
-    out = Path(a.out) if a.out else default_out(a.split, a.subset, ablate, a.salt)
+    out = Path(a.out) if a.out else default_out(a.split, a.subset, ablate, a.salt, limit=a.limit, only=only)
     rj = run(data_dir, a.split, a.subset, agents=ag, out=out, limit=a.limit or None, only=only, cache_only=a.cache_only,
              engine=a.engine, workers=a.workers, metric=metric, budget=budget, wait_quota=a.wait_quota,
              quota_poll_minutes=a.quota_poll_minutes, quota_max_hours=a.quota_max_hours, local_health=health)

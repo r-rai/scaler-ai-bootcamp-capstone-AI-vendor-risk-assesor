@@ -260,6 +260,7 @@ def test_cache_only_estimate_and_no_local_role_skip_the_check(tmp_path, monkeypa
     get = getter(exc=ConnectionRefusedError("down"))
     rc, _ = _main(tmp_path, monkeypatch, *extra, get=get)
     assert get.seen == []
+    assert rc == (runner.EXIT_PARTIAL if extra == ("--cache-only",) else 0)     # cache-only on an empty cache: every call misses
     if extra != ("--estimate",):
         assert run_json(tmp_path / "out")["local"]["health"] == "skipped"
 
@@ -530,3 +531,66 @@ def test_local_counts_across_a_quota_stop_and_its_resume(tmp_path, monkeypatch, 
         assert stopped["local"][k] == resumed["local"][k] == full["local"][k]
     assert full["local"]["calls"] > 0
     assert stopped["local"]["calls"] + resumed["local"]["calls"] == full["local"]["calls"]
+
+
+# ---------------------------------------------------------------- Task 8B2: Part B leftovers
+def test_the_slots_default_is_read_when_the_limiter_is_built(monkeypatch):
+    from vendor_verdict import config
+    monkeypatch.setattr(config, "LOCAL_SLOTS", 5)
+    assert local.limited(LocalLLM()).slots == 5 and local.LocalLimiter(LocalLLM()).slots == 5
+
+
+class StopAfter(LocalLLM):
+    """A local stub that sets `stop` (the event a Ctrl-C sets) once it has answered `n` calls; it records each call's case id."""
+
+    def __init__(self, stop, n):
+        super().__init__()
+        self.stop, self.n, self.cases = stop, n, []
+
+    def structured(self, system, user, schema, stage="", **kw):
+        self.cases.append(next(c for c in CASE_IDS if f" Case {c} page." in user))
+        out = super().structured(system, user, schema, stage=stage, **kw)
+        if len(self.cases) >= self.n:
+            self.stop.set()
+        return out
+
+
+def test_a_stop_during_prewarm_leaves_the_rest_unrouted(tmp_path, monkeypatch):
+    data = write_data(tmp_path / "data")
+    cases, pages, ids = runner.load_split(data, "test", "all")
+    triaged = []
+    real = local.rk.triage
+    monkeypatch.setattr(local.rk, "triage", lambda case, pgs: (triaged.append(case["case_id"]), real(case, pgs))[1])
+    stop = threading.Event()
+    stub = StopAfter(stop, 4)                          # case 1: 3 pages; case 2: the stop comes after its first page
+    got = local.prewarm(cases, pages, sorted(ids), local.LocalLimiter(stub, slots=1), tmp_path / "cache", workers=1, stop=stop)
+    assert stub.cases == ["c0001"] * 3 + ["c0002"] and triaged == ["c0001", "c0002"]       # c0003 never started
+    assert got["cases"] == 1 and got["pages"] == 3 and got["calls"] == 4 and got["failures"] == 0
+
+
+def test_a_stopped_prewarm_prints_the_partial_counts_and_exits_130(tmp_path, monkeypatch, capsys):
+    from vendor_verdict import config
+    monkeypatch.setattr(config, "LOCAL_SLOTS", 1)          # one worker: the stop lands after case 1, deterministically
+    data = write_data(tmp_path / "data", page_text=CANARY)
+    cases, pages, ids = runner.load_split(data, "test", "all")
+    stop = threading.Event()
+    stub = type("T", (StopAfter,), {"targets": TargetLocal.targets})(stop, 4)
+    ag = make_agents(tmp_path / "cache", local=stub)
+    rc = local.prewarm_cli(cases, pages, sorted(ids), ag, get=getter(), stop=stop)
+    text = capsys.readouterr().out
+    assert rc == local.EXIT_INTERRUPTED == runner.EXIT_INTERRUPTED == 130 and "c0003" not in stub.cases
+    assert "INTERRUPTED" in text and "cases 1 of 3" in text and "new calls 4" in text and CANARY not in text
+
+
+def test_prewarm_and_a_run_word_a_down_server_the_same_way(tmp_path, monkeypatch, capsys):
+    get = getter(exc=ConnectionRefusedError("down"))
+    rc, _ = _prewarm(tmp_path / "p", monkeypatch, get=get)
+    pre = [line for line in capsys.readouterr().out.splitlines() if "health" in line]
+    monkeypatch.setattr(runner, "run", lambda *a, **kw: pytest.fail("refused"))
+    rc2, _ = _main(tmp_path / "r", monkeypatch, get=get)
+    run_lines = [line for line in capsys.readouterr().out.splitlines() if "health" in line]
+    assert rc == rc2 == local.EXIT_LOCAL_DOWN and pre == run_lines and len(pre) == 1
+
+
+def test_the_prewarm_slot_of_the_local_block_is_documented_as_reserved():
+    assert "reserved, always null in run.json" in local.block.__doc__

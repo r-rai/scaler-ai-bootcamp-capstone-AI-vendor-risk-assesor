@@ -1,8 +1,10 @@
-"""The `--estimate` report of `python -m vendor_verdict run` (moved out of runner.py unchanged, ledger ruling R40, so the runner stays
-under its size limit): calls and tokens per role before a run, with no model call and no file write. runner.py re-exports
-`estimate` and `format_estimate`."""
+"""CLI helpers of `python -m vendor_verdict run`, kept out of runner.py so the runner stays under its size limit (ledger ruling R40):
+- the `--estimate` report (moved unchanged): calls and tokens per role before a run, with no model call and no file write;
+- `refusal`: the argument checks that run before anything is built, deleted or started (exit `EXIT_USAGE`).
+runner.py re-exports `estimate`, `format_estimate`, `refusal` and `EXIT_USAGE`."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from assessor.tracing import estimate_tokens
@@ -13,7 +15,50 @@ from .agents import planner as planner_agent
 from .agents import specialists as specialist_agents
 from .config import FAMILIES, GRADER_FIELDS, LOCAL_SCOPE
 from .nodes import Agents, _readable_pages
+from .nodes import ABLATIONS
 from .prompts import PLANNER_SYSTEM, ROUTER_SYSTEM, SPECIALIST_SYSTEM, page_user_prompt, version
+from .safe import safe_id
+
+EXIT_USAGE = 64                                        # EX_USAGE: refused arguments; nothing was built, deleted or started
+# options that mean nothing for --prewarm-local (it makes local calls only, needs the server up and exits before any run)
+_PREWARM_CONFLICTS = (("cache_only", "--cache-only"), ("estimate", "--estimate"), ("allow_local_down", "--allow-local-down"),
+                      ("wait_quota", "--wait-quota"))
+
+
+def only_ids(text: str | None) -> list[str] | None:
+    """The `--only` ids, deduplicated and sorted; None when the flag is absent; [] when it names no id."""
+    return None if text is None else sorted({c.strip() for c in text.split(",") if c.strip()})
+
+
+def refusal(a, data_dir: Path) -> str | None:
+    """Why the `run` arguments are refused, or None. Checked before the agents are built and before any output is removed:
+    a negative --limit; a --max-usd that is not a finite number >= 0 (absent = no cap); an unknown ablation; --only naming no id or
+    an id that is not a case of the selected split and subset (before --limit; the message names those ids, which are case ids);
+    --prewarm-local with an option that means nothing for it. Only --only reads the data dir (cases.csv, never pages)."""
+    if a.limit < 0:
+        return f"--limit {a.limit}: must be 0 (every case) or a positive number"
+    if a.max_usd is not None and not (math.isfinite(a.max_usd) and a.max_usd >= 0):
+        return "--max-usd: must be a finite number >= 0 (leave it out for no cap)"
+    bad = sorted({x.strip() for x in (a.ablate or "").split(",") if x.strip()} - ABLATIONS)
+    if bad:
+        return f"--ablate: unknown ablation(s) {bad}; known: {sorted(ABLATIONS)}"
+    if a.prewarm_local:
+        given = [flag for attr, flag in _PREWARM_CONFLICTS if getattr(a, attr)]
+        if given:
+            return f"--prewarm-local cannot be combined with {', '.join(given)}"
+    only = only_ids(a.only)
+    if only is not None:
+        if not only:
+            return "--only names no case id"
+        try:
+            pool = set(rk.select_cases(rk.load_cases(Path(data_dir)), a.split, a.subset, None, None))
+        except (OSError, ValueError, KeyError) as exc:
+            return f"--only: cannot read the case list in --data ({type(exc).__name__})"
+        unknown = sorted(set(only) - pool)
+        if unknown:
+            return (f"--only: {len(unknown)} id(s) not among the {a.split}/{a.subset} cases: "
+                    + ", ".join(safe_id(c) for c in unknown))
+    return None
 
 
 def _exists(root: Path, key: str) -> bool:

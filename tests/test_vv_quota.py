@@ -671,6 +671,48 @@ def test_the_keyword_kind_needs_no_status_or_a_quota_like_one(status):
     assert kind == ("rate_limit" if status == 429 else "keyword")
 
 
+# ---------------------------------------------------------------- Task 8B2: R41 (rate-limit wording on a 5xx) and the guards' tests
+@pytest.mark.parametrize("msg", ["rate limit", "Rate Limit reached", "upstream 429", "429 too many requests"])
+@pytest.mark.parametrize("status", [500, 502, 503, 599])
+def test_rate_limit_wording_on_a_5xx_is_a_rate_limit(msg, status):              # R41: the old 4/12/36/60 s ladder for an overload
+    assert is_quota_error(llm_error(msg, status=status)) == "rate_limit"
+
+
+@pytest.mark.parametrize("status", [400, 409, 413, 499, 600])
+def test_rate_limit_wording_on_a_4xx_or_other_status_is_not(status):
+    assert is_quota_error(llm_error("rate limit; you requested 14293 tokens", status=status)) is None
+
+
+def test_a_429_status_wins_on_its_own():
+    assert is_quota_error(llm_error("", status=429)) == "rate_limit"
+    assert is_quota_error(llm_error("all good, nothing to see", status=429)) == "rate_limit"
+
+
+@pytest.mark.parametrize("status", [400, 413])
+def test_quota_words_at_a_deterministic_status_are_not_a_keyword_quota_error(status):
+    assert is_quota_error(llm_error("context length limit exceeded", status=status)) is None
+
+
+@pytest.mark.parametrize("status", [None, 402, 403])
+def test_quota_words_with_no_status_or_a_quota_like_status_are_the_keyword_kind(status):
+    assert is_quota_error(llm_error("context length limit exceeded", status=status)) == "keyword"
+
+
+@pytest.mark.parametrize("status", [409, 410, 418, 451])
+def test_the_keyword_kind_is_restricted_to_its_statuses(status):
+    # kills the mutant "the keyword kind applies at any status": these 4xx are in neither status set
+    assert status not in quota.NON_QUOTA_STATUSES and status not in quota._KEYWORD_STATUSES
+    assert is_quota_error(llm_error("quota exceeded for this key", status=status)) is None
+
+
+def test_a_non_quota_status_wins_even_if_the_keyword_statuses_grew(monkeypatch):
+    # kills the mutant "no NON_QUOTA_STATUSES early return": ruling R39 says a known non-quota status wins over ANY later rule, so
+    # the early return must hold even if a later rule (here the keyword statuses) were widened to include that status
+    monkeypatch.setattr(quota, "_KEYWORD_STATUSES", quota._KEYWORD_STATUSES | quota.NON_QUOTA_STATUSES)
+    for status in sorted(quota.NON_QUOTA_STATUSES):
+        assert is_quota_error(llm_error("context length limit exceeded", status=status)) is None
+
+
 def test_a_deterministic_400_is_one_failed_call_again(tmp_path, no_ladder_sleep):
     llm = persistent(llm_error("context length limit exceeded; you requested 14293 tokens", status=400))
     assert read_page(llm, CallCache(tmp_path), "ai", PAGE) == ([], ["failed: LLMError"])
@@ -721,8 +763,8 @@ def test_no_second_sleeper_between_the_wait_and_the_probe():
         def __exit__(self, *exc):
             out = super().__exit__(*exc)
             if armed[0] and threading.get_ident() == ids.get("sleeper"):
-                armed[0] = False
                 reacted.wait(timeout=10)                    # the woken worker either waits again (correct) or sleeps (the race)
+                armed[0] = False                            # after the wait: a re-wait while armed sets `reacted` (no 10 s stall)
             return out
     gate._cond = HookCond()
     gate.trip(QuotaExhausted("rate_limit", 429, ""))

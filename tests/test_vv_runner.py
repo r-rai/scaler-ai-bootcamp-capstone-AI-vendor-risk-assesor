@@ -685,7 +685,9 @@ class ChargingReader(ReaderLLM):
         return out
 
 
-def test_no_money_cap_by_default(tmp_path):
+def test_no_money_cap_by_default(tmp_path, monkeypatch):
+    import assessor.tracing as tracing
+    monkeypatch.setattr(tracing, "price_for", lambda *a, **kw: (0.15, 0.60))     # pinned: a PRICE_IN_PER_MTOK=0 env cannot void it
     budget = runner.make_budget(None)
     out = run_fixture(tmp_path, reader=ChargingReader(budget), budget=budget)
     rj = run_json(out)
@@ -702,3 +704,154 @@ def test_max_usd_defaults_to_no_cap():
     a = runner.build_parser().parse_args(["run", "--split", "test", "--subset", "all"])
     assert a.max_usd is None and runner.make_budget(None).max_usd == float("inf")
     assert runner.build_parser().parse_args(["run", "--split", "test", "--subset", "all", "--max-usd", "2.5"]).max_usd == 2.5
+
+
+# ---------------------------------------------------------------- Task 8B2: runner hygiene
+def test_the_flag_table_covers_every_node_flag():
+    from vendor_verdict.nodes import FLAG_KEYS
+    assert set(runner._FLAG_ROLE) == set(FLAG_KEYS) and set(runner._FLAG_ROLE.values()) <= set(runner.ROLES)
+
+
+def _refused(tmp_path, monkeypatch, capsys, *argv, split="test"):
+    """main() with arguments it must refuse: nothing is built, run, deleted or written."""
+    data = write_data(tmp_path / "data", split=split)
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    (out / "submission.csv").write_text("earlier", encoding="utf-8")
+    monkeypatch.setattr(runner, "build_agents", lambda a, d: pytest.fail("built agents for refused arguments"))
+    monkeypatch.setattr(runner, "run", lambda *a, **kw: pytest.fail("started a run for refused arguments"))
+    rc = runner.main(["run", "--data", str(data), "--split", split, "--subset", "all", "--out", str(out), *argv])
+    assert rc == runner.EXIT_USAGE and (out / "submission.csv").read_text() == "earlier" and sorted(out.iterdir()) == [out / "submission.csv"]
+    cap = capsys.readouterr()
+    return cap.out + cap.err
+
+
+def test_the_usage_exit_code_is_its_own():
+    assert runner.EXIT_USAGE not in (0, 1, 3, 69, 75, 130)
+    assert f"{runner.EXIT_USAGE} " in runner.__doc__ and "refused" in runner.__doc__
+
+
+@pytest.mark.parametrize("only,named", [("c9999", ["c9999"]), ("c0001,c9999,c8888", ["c8888", "c9999"])])
+def test_only_with_unknown_case_ids_is_refused_and_names_them(tmp_path, monkeypatch, capsys, only, named):
+    text = _refused(tmp_path, monkeypatch, capsys, "--only", only)
+    assert all(c in text for c in named) and "c0001" not in text
+
+
+@pytest.mark.parametrize("only", [",", " , ", ""])
+def test_only_with_no_case_id_is_refused(tmp_path, monkeypatch, capsys, only):
+    assert "--only" in _refused(tmp_path, monkeypatch, capsys, "--only", only)
+
+
+def test_only_with_an_id_of_another_subset_is_refused(tmp_path, monkeypatch, capsys):
+    data = write_data(tmp_path / "data", split="train")            # dev = c0001, c0003 (even positions); holdout = c0002
+    monkeypatch.setattr(runner, "build_agents", lambda a, d: pytest.fail("built agents for refused arguments"))
+    rc = runner.main(["run", "--data", str(data), "--split", "train", "--subset", "dev", "--only", "c0002", "--out",
+                      str(tmp_path / "out")])
+    assert rc == runner.EXIT_USAGE and "c0002" in capsys.readouterr().err and not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("argv", [("--limit", "-1"), ("--max-usd", "nan"), ("--max-usd", "inf"), ("--max-usd=-inf",),
+                                  ("--max-usd", "-0.5"), ("--ablate", "planner")])
+def test_bad_numbers_and_ablations_are_refused(tmp_path, monkeypatch, capsys, argv):
+    assert argv[0].split("=")[0] in _refused(tmp_path, monkeypatch, capsys, *argv)
+
+
+@pytest.mark.parametrize("extra", [("--cache-only",), ("--estimate",), ("--allow-local-down",), ("--wait-quota",)])
+def test_prewarm_with_an_option_that_makes_no_sense_for_it_is_refused(tmp_path, monkeypatch, capsys, extra):
+    assert extra[0] in _refused(tmp_path, monkeypatch, capsys, "--prewarm-local", *extra)
+
+
+def test_no_money_cap_stays_the_default_and_a_zero_cap_is_allowed(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(runner, "build_agents", lambda a, d: (seen.append(a.max_usd), (make_agents(tmp_path / "cache"), None,
+                                                                                       StubMetric()))[1])
+    data = write_data(tmp_path / "data")
+    for extra in ((), ("--max-usd", "0")):
+        runner.main(["run", "--data", str(data), "--split", "test", "--subset", "all", "--out", str(tmp_path / "out"), *extra])
+    assert seen == [None, 0.0]
+
+
+def test_default_out_dir_names_for_limited_and_only_runs():
+    import hashlib
+    h = hashlib.sha1(b"c0001,c0002").hexdigest()[:8]
+    base = ROOT / "reports" / "vendor_verdict"
+    assert runner.default_out("test", "all", frozenset(), "") == base / "test_all"                 # a full run keeps its name
+    assert runner.default_out("test", "all", frozenset(), "", limit=None, only=None) == base / "test_all"
+    assert runner.default_out("test", "all", frozenset(), "", limit=0) == base / "test_all"
+    assert runner.default_out("test", "all", frozenset(), "", limit=5) == base / "test_all_limit-5"
+    assert runner.default_out("test", "all", frozenset(), "", only=["c0002", "c0001"]) == base / f"test_all_only-{h}"
+    assert runner.default_out("train", "dev", frozenset({"router", "grader"}), "s/1", limit=2, only=["c0001", "c0002"]) == \
+        base / f"train_dev_limit-2_only-{h}_ablate-grader+router_salt-s_1"
+    assert runner.default_out("test", "all", frozenset({"decision_maker"}), "") == base / "test_all_ablate-decision_maker"
+    name = runner.default_out("test", "all", frozenset(), "", only=["c0001", "c0002"]).name
+    assert "c0001" not in name and "c0002" not in name and len(name) == len("test_all_only-") + 8
+
+
+def test_a_limited_run_never_touches_a_full_runs_default_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)                  # the default location, under tmp_path
+    data = write_data(tmp_path / "data")
+    monkeypatch.setattr(runner, "build_agents", lambda a, d: (make_agents(tmp_path / "cache"), None, StubMetric()))
+    base = tmp_path / "reports" / "vendor_verdict"
+    assert runner.main(["run", "--data", str(data), "--split", "test", "--subset", "all"]) == 0
+    full = base / "test_all"
+    assert (full / "submission.csv").exists()
+    before = {p.name: p.read_bytes() for p in full.iterdir() if p.is_file()}
+    assert runner.main(["run", "--data", str(data), "--split", "test", "--subset", "all", "--limit", "1"]) == 0
+    assert runner.main(["run", "--data", str(data), "--split", "test", "--subset", "all", "--only", "c0002,c0001"]) == 0
+    assert {p.name: p.read_bytes() for p in full.iterdir() if p.is_file()} == before
+    dirs = sorted(p.name for p in base.iterdir())
+    assert len(dirs) == 3 and "test_all_limit-1" in dirs and not any("c000" in d for d in dirs)
+    for d in dirs[1:]:
+        assert not (base / d / "submission.csv").exists() and run_json(base / d)["cases"]["selected"] in (1, 2)
+
+
+def _no_orphan_submission(out: Path) -> None:
+    assert not (out / "submission.csv.tmp").exists() and not (out / "run.json.tmp").exists()
+    if (out / "submission.csv").exists():
+        rj = run_json(out)                                         # a complete run.json that matches it
+        assert rj["submission"]["written"] is True and rj["submission"]["problems"] == []
+
+
+def test_a_failed_submission_write_leaves_no_submission(tmp_path, monkeypatch):
+    real = runner.rk.write_submission
+
+    def half(path, *a, **kw):
+        real(path, *a, **kw)
+        raise OSError("disk full")
+    monkeypatch.setattr(runner.rk, "write_submission", half)
+    with pytest.raises(OSError):
+        run_fixture(tmp_path)
+    out = tmp_path / "out"
+    assert not (out / "submission.csv").exists()
+    _no_orphan_submission(out)
+
+
+def test_a_failed_run_json_write_leaves_no_submission(tmp_path, monkeypatch):
+    real = runner._write_atomic
+
+    def fail_run_json(path, text):
+        if Path(path).name == "run.json":
+            raise OSError("disk full")
+        return real(path, text)
+    monkeypatch.setattr(runner, "_write_atomic", fail_run_json)
+    with pytest.raises(OSError):
+        run_fixture(tmp_path)
+    out = tmp_path / "out"
+    assert not (out / "submission.csv").exists() and not (out / "run.json").exists()
+    _no_orphan_submission(out)
+
+
+def test_a_complete_run_writes_run_json_and_then_the_submission(tmp_path):
+    out = run_fixture(tmp_path)
+    assert (out / "submission.csv").exists() and run_json(out)["submission"]["written"] is True
+    _no_orphan_submission(out)
+
+
+def test_stop_exceptions_hold_quota_exhausted():
+    from vendor_verdict.quota import QuotaExhausted
+    assert QuotaExhausted in runner.STOP_EXCEPTIONS                 # so the outcome loop needs no second QuotaExhausted
+
+
+def test_previous_resume_count_of_an_unreadable_run_json_is_one(tmp_path):
+    (tmp_path / "run.json").write_text("not json", encoding="utf-8")
+    assert runner.previous_resume_count(tmp_path) == 1 and "counts as 1" in runner.previous_resume_count.__doc__
