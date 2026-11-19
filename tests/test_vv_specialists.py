@@ -451,13 +451,21 @@ def _rid(field, n=0, pid="c9999_p2"):
 
 
 def test_training_no_read_from_silence_is_dropped_with_its_reading_id_and_reason():
-    for display, quote in (("Training on customer data is not mentioned", "Acme builds invented tools."),
-                           ("", "The page does not state whether customer data is used for training.")):
-        for value in ("no", "No"):
-            pc, notes = to_page_claims([reading("trains_on_customer_data", value, page_id="c9999_p2", quote=quote, display=display)],
-                                       REC_NEW, "Acme Inc.")
-            assert pc.claims == []
-            assert notes == [f"c9999_p2: {_rid('trains_on_customer_data')}: dropped trains_on_customer_data: absence_statement"]
+    for value in ("no", "No"):
+        pc, notes = to_page_claims([reading("trains_on_customer_data", value, page_id="c9999_p2", quote="Acme builds invented tools.",
+                                            display="Training on customer data is not mentioned")], REC_NEW, "Acme Inc.")
+        assert pc.claims == []
+        assert notes == [f"c9999_p2: {_rid('trains_on_customer_data')}: dropped trains_on_customer_data: absence_statement"]
+
+
+def test_the_silence_guards_read_the_display_only_never_the_quote():
+    # fix round 1 (R50): with no display, a real negative whose quote happens to match the absence pattern is kept
+    for field, value, quote in (("trains_on_customer_data", "no", "No data from customers is used to train models."),
+                                ("trains_on_customer_data", "no", "We do not use customer data for training, as described in our DPA."),
+                                ("security_incidents", [], "No security incidents have been disclosed."),
+                                ("security_incidents", [], "No publicly disclosed incidents.")):
+        pc, notes = to_page_claims([reading(field, value, page_id="c9999_p2", quote=quote, display="")], REC_NEW, "Acme Inc.")
+        assert [(c.field, c.value) for c in pc.claims] == [(field, value)] and notes == [], quote
 
 
 def test_a_stated_no_training_is_kept():

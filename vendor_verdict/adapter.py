@@ -16,10 +16,10 @@ A Claim's display is the reading's `display` (the specialist's own short stateme
 read from silence.
 
 Silence guards (GATE-P): two PASS-making values have no such guard downstream, so the adapter applies the same published rule (rule 3:
-a field the sources do not state is unknown) with the same test (`claims.is_absence_statement` on the same display) after
-normalisation: `trains_on_customer_data="no"` and a `security_incidents` value of [] whose display (else quote) reports that something
-is not mentioned are dropped. Only these exact values are guarded: a real incident item is never dropped by its display. This is the
-one place where the facts may differ from the baseline path's, on purpose (a reading resting on silence is UNKNOWN, never a PASS).
+a field the sources do not state is unknown) with the same test (`claims.is_absence_statement`), after normalisation, on the
+model's own `display` ONLY (ruling R50; an empty display is never guarded, so a real negative quote is not dropped):
+`trains_on_customer_data="no"` and a `security_incidents` value of [] whose display reports that something is not mentioned are
+dropped. Only these exact values are guarded: a real incident item is never dropped by its display. This is the one place where the facts may differ from the baseline path's, on purpose (a reading resting on silence is UNKNOWN, never a PASS).
 
 Notes are sanitised: kaggle_policy's own notes can quote a page value or a holder name, so only the page id, the reading id (when it
 is id-shaped), the field name and a fixed reason word reach the caller, never a quote, a value or a display (no page text may reach
@@ -44,7 +44,9 @@ from eval import run_kaggle as rk
 from .config import FIELD_FAMILY
 
 DISPLAY_CLIP = 300            # claims.normalise_claim clips display to 300 characters: the guard must see the same text
-_ECHO_READING_ID = re.compile(r"[A-Za-z0-9_.:-]{1,120}")      # reading_id() joins validated parts; anything else could be page text
+# Echoing an id-shaped string is safe only because reading ids are minted by code (state.reading_id) from validated page ids and
+# fixed family/field names; anything that does not look like one could be page text and is replaced by its length.
+_ECHO_READING_ID = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 _ABSENCE_REASON = "absence of a mention"                       # the start of claims.normalise_claim's absence-guard reason
 
 
@@ -58,10 +60,13 @@ def _rid(reading: dict) -> str:
     return text if _ECHO_READING_ID.fullmatch(text) else f"<{len(text)} chars>"
 
 
-def _from_silence(c: Claim) -> bool:
-    """A normalised PASS-making value with no downstream absence guard, whose display reports a missing mention (rule 3)."""
+def _from_silence(c: Claim, reading: dict) -> bool:
+    """A normalised PASS-making value with no downstream absence guard, whose model-written `display` (ONLY: never the quote fallback,
+    ruling R50: a real negative such as "No security incidents have been disclosed" matches the absence pattern) reports a missing
+    mention (rule 3). An empty display is never guarded."""
     negative = (c.field == "trains_on_customer_data" and c.value == "no") or (c.field == "security_incidents" and c.value == [])
-    return negative and is_absence_statement(c.display)
+    display = reading.get("display")
+    return negative and isinstance(display, str) and bool(display.strip()) and is_absence_statement(display[:DISPLAY_CLIP])
 
 
 def _normalise_reason(probe: Claim) -> str | None:
@@ -95,9 +100,12 @@ def to_page_claims(readings: list[dict], rec: dict, legal_entity: str) -> tuple[
     probes = [c.model_copy(deep=True) for c in claims]   # the reasons are found on copies; the facts come from the real call below
     kept, _why = kp.normalise_page_claims(claims)
     survivors = {id(c) for c in kept}
-    guarded = {id(c) for c in kept if _from_silence(c)}
+    reading_of = {id(c): r for c, r in pairs}
+    guarded = {id(c) for c in kept if _from_silence(c, reading_of[id(c)])}
     kept = [c for c in kept if id(c) not in guarded]
     pc = kp.PageClaims(page_id, rec["role"], kp.page_date(rec["page"]), kept)
+    # relies on two kaggle_policy facts: normalise_page_claims returns the SAME Claim objects it keeps (identity), and
+    # drop_subprocessor_derived_regions is its only drop that depends on the page's other claims
     for (c, r), probe in zip(pairs, probes):
         field = _field_of(c.field + ":")
         if id(c) in guarded:

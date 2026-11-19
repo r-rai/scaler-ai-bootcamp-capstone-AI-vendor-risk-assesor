@@ -206,9 +206,12 @@ def test_display_line_does_not_invite_a_reading_from_silence_and_its_wording_tri
 
 def test_certification_status_rule_bare_claim_is_certified_mere_mention_is_no_reading():
     text = SPECIALIST_SYSTEM["certifications"]
-    assert '"certified" when the page says the certification is held, even without issuer or date (a claim)' in text
+    # fix round 1 (R49, rule 4): a bare name, badge or list entry is a claim -> "certified"; one instruction, no contradicting sentence
+    assert '"certified" when the page lists or presents the certification as held (a bare name, a badge or a list entry included' in text
     assert '"in_progress" when the page says it is being worked towards' in text
-    assert "without saying it is held or being worked towards gives no reading for it" in text
+    assert "No reading only when the page merely mentions a certification without presenting it as held or in progress" in text
+    assert "without saying it is held or being worked towards gives no reading for it" not in text
+    assert 'A bare "SOC 2 Type II" is a claim: report it with issuer and date null' in text
     # holder-neutral: the call names no vendor or legal entity, and attributing a holder is check_holders' job (registry pages only)
     assert "the vendor holds" not in text and "the vendor is working" not in text
     assert "Use null for every other key the page does not state." in text
@@ -222,3 +225,10 @@ def test_certification_dates_are_iso_and_never_the_page_dates():
     page = {"page_id": "p1", "url": "u", "title": "t", "published_date": "2026-01-01", "last_updated": "2026-02-01", "text": "x"}
     user = page_user_prompt(page)
     assert "Published: " in user and "Last updated: " in user                  # the call does send the page dates the rule names
+
+
+def test_decision_prompt_describes_the_quote_as_the_call_sends_it():
+    # fix round 1 (R51): a multi-reading candidate's quotes are joined with " | " (decision_maker._candidate_quote)
+    assert 'a quote (one verbatim quote, or several joined by " | ")' in DECISION_SYSTEM
+    assert "each with a value, a verbatim quote and a grade" not in DECISION_SYSTEM
+    assert len(DECISION_SYSTEM) <= 1200

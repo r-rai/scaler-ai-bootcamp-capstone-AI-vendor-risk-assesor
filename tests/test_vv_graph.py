@@ -619,12 +619,18 @@ def test_a_short_display_canary_never_reaches_trace_notes_or_output(capsys):
     extra = {("ai", "p1"): [{"field": "trains_on_customer_data", "value": "no", "quote": "We do not train models on customer data.",
                              "display": short}],
              ("access_incidents", "p1"): [{"field": "security_incidents", "value": [], "quote": "Invented trust page.", "display": short},
-                                          {"field": "sso_saml", "value": "all_plans", "quote": "Single sign-on (SAML) is offered on every plan.",
-                                           "display": CANARY}]}
+                                          {"field": "security_incidents", "quote": "Invented trust page.", "display": CANARY,
+                                           "value": {"date": "2026-02-02", "summary": "Invented outage", "severity": "minor",
+                                                     "postmortem_published": False}}]}
     for engine in ("plain", "langgraph"):
         ag = make_ag(grade="unsure", reader=ReaderLLM(extra=extra))
         s = run_plain(new_state(CASE, PAGES), ag) if engine == "plain" else build_langgraph(ag).invoke(new_state(CASE, PAGES))
         assert any("absence_statement" in n for n in s["notes"])               # the canary display went down the new note path
+        # the kept reading with a canary display was really merged (the kept path is shown, not assumed)
+        assert [i["date"] for i in s["facts"]["security_incidents"]["value"]] == ["2026-02-02"]
+        # nowhere in what the run produces, except the readings (and conflict candidates) that hold model-written text by design
+        produced = {k: v for k, v in s.items() if k not in ("readings", "conflicts", "trace")}
+        assert CANARY not in json.dumps(produced, default=str)
         assert CANARY not in json.dumps(s["trace"].to_json()) and CANARY not in s["trace"].to_markdown()
         assert not any(CANARY in n for n in s["notes"])
     out = capsys.readouterr()
