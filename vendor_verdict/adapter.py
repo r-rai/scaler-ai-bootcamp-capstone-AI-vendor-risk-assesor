@@ -11,6 +11,9 @@ taking its page's whole list with it. A reading whose value is already a list (e
 `evidence_level` is not derived here: `kp.build_facts` sets it on the merged certificates (`kp.is_documented`: a certified
 "SOC 2 Type II" or "ISO 27001" with issuer and date) and rules_lite reads it only from that fact; `Claim.evidence_level` is not read.
 
+A Claim's display is the reading's `display` (the specialist's own short statement), else its quote: the absence-statement guard in
+`claims.normalise_claim` reads it.
+
 Notes are sanitised: kaggle_policy's own notes can quote a page value or a holder name, so only the page id, the field name and a
 fixed reason reach the caller (no page text may reach notes, logs or traces).
 """
@@ -49,7 +52,10 @@ def to_page_claims(readings: list[dict], rec: dict, legal_entity: str) -> tuple[
             continue
         value = copy.deepcopy(r["value"])            # normalise and the holder check edit values in place; readings stay as read
         try:
-            claims.append(Claim(field=r["field"], value=value, display=str(value)[:120], quote=r["quote"]))
+            # display = the model's own wording (else the quote), so claims.normalise_claim's absence guard can drop a negative
+            # value read from silence ("SSO is not mentioned"), exactly as it does on the baseline path
+            display = str(r.get("display") or r.get("quote") or "")[:120]
+            claims.append(Claim(field=r["field"], value=value, display=display, quote=r["quote"]))
         except ValidationError:
             notes.append(f"{page_id}: dropped {_field_of(str(r.get('field')) + ':')}: not a fact field")
     kept, why = kp.normalise_page_claims(claims)

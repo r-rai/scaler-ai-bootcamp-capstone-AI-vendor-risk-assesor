@@ -21,10 +21,11 @@ Rules:
 - Report only what a page states. A field no page states is unknown: leave it out. Never guess or infer from silence.
 - Every reading needs a quote: a verbatim copy of the page sentence that states the value (exact text, no paraphrase).
 - If a `page_id:` line precedes a page block, copy that id into page_id of every reading taken from that page. With a single page and no such line, leave page_id as an empty string.
+- display: your own short statement of what the page says about the field; if the page only fails to mention it, say so.
 """
 
 _SPECIALIST_TAIL = """
-Reply with JSON only: {"readings": [{"page_id": "...", "field": "...", "value": ..., "quote": "..."}]}"""
+Reply with JSON only: {"readings": [{"page_id": "...", "field": "...", "value": ..., "quote": "...", "display": "..."}]}"""
 
 _CERTIFICATIONS = """
 Field: security_certifications. One reading per certification. value is an object:
@@ -56,6 +57,7 @@ _ACCESS_INCIDENTS = """
 Fields: sso_saml, security_incidents.
 - sso_saml (single sign-on, SAML / OIDC): "all_plans" | "paid_plans" | "enterprise_only" | "none".
 - security_incidents: one reading per incident; value {"date": ..., "summary": ..., "severity": ..., "postmortem_published": ...}. date YYYY-MM-DD; summary a short description; severity "major" | "critical" | "minor"; postmortem_published true | false.
+- If the page says the vendor has had no security incidents, give ONE security_incidents reading with value [] and quote the sentence that says so.
 - Use null for every key the page does not state.
 """
 

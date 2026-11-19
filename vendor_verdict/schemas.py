@@ -13,6 +13,7 @@ class FieldReading(BaseModel):
     field: str
     value: Any
     quote: str = Field(min_length=1)
+    display: str = ""        # the model's own short statement; the absence guard (claims.normalise_claim) reads it
 
 
 class SpecialistOut(BaseModel):

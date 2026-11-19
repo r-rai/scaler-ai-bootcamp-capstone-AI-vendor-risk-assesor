@@ -160,3 +160,24 @@ def test_decision_out_rejects_non_strict_or_negative_index(bad):
 def test_decision_out_accepts_none_and_zero():
     assert DecisionOut.model_validate({"choice": None}).choice is None
     assert DecisionOut.model_validate({"choice": 0}).choice == 0
+
+
+# ------------------------------------------------------------------------------------------------ Task 3 fix round 1
+NO_INCIDENTS_LINE = "If the page says the vendor has had no security incidents, give ONE security_incidents reading with value [] and quote the sentence that says so."
+
+
+def test_no_incidents_line_is_only_in_the_access_incidents_prompt():
+    assert NO_INCIDENTS_LINE in SPECIALIST_SYSTEM["access_incidents"]
+    assert all(NO_INCIDENTS_LINE not in t for f, t in SPECIALIST_SYSTEM.items() if f != "access_incidents")
+
+
+def test_specialist_head_asks_for_a_display_statement_including_silence():
+    for fam, text in SPECIALIST_SYSTEM.items():
+        assert "display: your own short statement of what the page says about the field" in text, fam
+        assert "if the page only fails to mention it, say so" in text, fam
+        assert '"display": "..."' in text, fam
+
+
+def test_field_reading_display_is_optional_and_defaults_to_empty():
+    assert FieldReading.model_validate({"field": "sso_saml", "value": "none", "quote": "q"}).display == ""
+    assert FieldReading.model_validate({"field": "sso_saml", "value": "none", "quote": "q", "display": "d"}).display == "d"

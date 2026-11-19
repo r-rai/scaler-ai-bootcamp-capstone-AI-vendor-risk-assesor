@@ -10,6 +10,7 @@ import pytest
 from assessor.llm import LLMError
 from assessor.schemas import Claim
 from assessor.tracing import BudgetExceeded
+from vendor_verdict import adapter
 from vendor_verdict.adapter import facts_for_case, to_page_claims
 from vendor_verdict.agents import specialists
 from vendor_verdict.agents.specialists import read_case, read_page
@@ -51,9 +52,9 @@ class RaisingLLM:
         raise self.exc
 
 
-def reading(field, value, page_id="p1", quote="q", n=0, family="x"):
+def reading(field, value, page_id="p1", quote="q", n=0, family="x", display=""):
     return {"id": reading_id(1, family, page_id, field, n), "iteration": 1, "family": family, "page_id": page_id,
-            "field": field, "value": value, "quote": quote}
+            "field": field, "value": value, "quote": quote, "display": display}
 
 
 # ------------------------------------------------------------------------------------------------ brief tests (verbatim)
@@ -94,35 +95,49 @@ def test_case_read_drops_item_citing_foreign_page(tmp_path):
 # ------------------------------------------------------------------------------------------------ equivalence fixture
 CASE = {"case_id": "c9999", "vendor": "Acme", "legal_entity": "Acme Inc.", "official_domain": "acme.example", "as_of": "2026-11-01",
         "tier": "T2", "users": "50", "question": "Can we use Acme?"}
-_OLD = {"page_id": "c9999_p1", "url": "https://acme.example/security", "source_type": "official", "last_updated": "2026-01-10"}
-_NEW = {"page_id": "c9999_p2", "url": "https://trust.acme.example/", "source_type": "official", "last_updated": "2026-06-15"}
-_REG = {"page_id": "c9999_p3", "url": "https://registry.example/acme", "source_type": "regulator", "last_updated": "2026-05-01"}
-_BAD = {"page_id": "c9999_p4", "url": "https://acme.example/legal", "source_type": "official", "last_updated": "2026-04-01"}
-_ROLES = {"c9999_p1": "official", "c9999_p2": "official", "c9999_p3": "registry", "c9999_p4": "official"}
+# published_date differs from last_updated, and their order is inverted between p1 and p2 (and p5): kp.page_date must decide
+_OLD = {"page_id": "c9999_p1", "url": "https://acme.example/security", "source_type": "official", "last_updated": "2026-01-10", "published_date": "2026-08-01"}
+_NEW = {"page_id": "c9999_p2", "url": "https://trust.acme.example/", "source_type": "official", "last_updated": "2026-06-15", "published_date": "2025-01-01"}
+_REG = {"page_id": "c9999_p3", "url": "https://registry.example/acme", "source_type": "regulator", "last_updated": "2026-05-01", "published_date": "2026-04-20"}
+_BAD = {"page_id": "c9999_p4", "url": "https://acme.example/legal", "source_type": "official", "last_updated": "2026-04-01", "published_date": "2026-03-01"}
+_SILENT = {"page_id": "c9999_p5", "url": "https://acme.example/pricing", "source_type": "official", "last_updated": "2026-09-01", "published_date": "2026-02-01"}
+_ROLES = {"c9999_p1": "official", "c9999_p2": "official", "c9999_p3": "registry", "c9999_p4": "official", "c9999_p5": "official"}
 
-# page_id -> [(field, [items] for a list field | value for a scalar field)]; the same invented statements feed both paths
+# page_id -> [(field, [items] for a list field | value for a scalar field, quote per item | quote, display)];
+# the same invented statements feed both paths
 _STATEMENTS = {
-    "c9999_p1": [("security_certifications", [{"name": "SOC 2", "status": "certified", "date": None, "valid_until": None, "issuer": None, "holder": None}]),
-                 ("sso_saml", "paid_plans"),
-                 ("trains_on_customer_data", "yes"),
-                 ("subprocessors", [{"name": "OldHost", "category": "hosting", "country": "Germany"}])],
+    "c9999_p1": [("security_certifications", [{"name": "SOC 2", "status": "certified", "date": None, "valid_until": None, "issuer": None, "holder": None}],
+                  ["Acme is SOC 2 compliant."], "SOC 2 compliant"),
+                 ("sso_saml", "paid_plans", "SSO comes with every paid plan.", "SSO on paid plans"),
+                 ("trains_on_customer_data", "yes", "We use customer content to improve our models.", "trains on customer content"),
+                 ("subprocessors", [{"name": "OldHost", "category": "hosting", "country": "Germany"}], ["OldHost hosts our servers."], "OldHost hosting")],
     "c9999_p2": [("security_certifications", [{"name": "SOC 2 Type II", "status": "certified", "date": "2026-03-31", "valid_until": None,
-                                               "issuer": "Invented Audit LLP", "holder": "Acme"}]),
-                 ("sso_saml", "enterprise_only"),
-                 ("trains_on_customer_data", "no_on_paid_plans"),
-                 ("dpa_available", "on_request"),
-                 ("data_regions", {"available": ["United States", "Germany"], "planned": ["India"]}),
-                 ("data_retention", {"default_days": 30, "deletion_on_request_days": 7}),
+                                               "issuer": "Invented Audit LLP", "holder": "Acme"}],
+                  ["Our SOC 2 Type II report dated 31 March 2026 was issued by Invented Audit LLP."], "SOC 2 Type II report by Invented Audit LLP"),
+                 ("sso_saml", "enterprise_only", "SAML SSO is available on the Enterprise plan.", "SSO on Enterprise only"),
+                 ("trains_on_customer_data", "no_on_paid_plans", "Paid workspaces are never used for training.", "no training on paid plans"),
+                 ("dpa_available", "on_request", "Ask your account manager for our DPA.", "DPA on request"),
+                 ("data_regions", {"available": ["United States", "Germany"], "planned": ["India"]},
+                  "Customer data is stored in the United States or Germany; India is coming soon.", "US and Germany, India planned"),
+                 ("data_regions", {"available": ["Ireland"], "planned": []},          # the sub-processor line: dropped on both paths
+                  "MailCo sends our transactional email from Ireland.", "Ireland"),
+                 ("data_retention", {"default_days": 30, "deletion_on_request_days": 7},
+                  "We keep data for 30 days and delete it within 7 days of a request.", "30 days, deletion in 7"),
                  ("subprocessors", [{"name": "CloudCo", "category": "hosting", "country": "United States"},
                                     {"name": "ModelCo", "category": "model_provider", "country": "United States"},
-                                    {"name": "MailCo", "category": "email", "country": "Ireland"}]),
+                                    {"name": "MailCo", "category": "email", "country": "Ireland"}],
+                  ["CloudCo hosts the platform.", "ModelCo provides the language model.", "MailCo sends email."], "3 sub-processors"),
                  ("security_incidents", [{"date": "2026-02-02", "summary": "Invented outage", "severity": "major", "postmortem_published": True},
-                                         {"date": "2025-07-07", "summary": "Invented minor issue", "severity": "minor", "postmortem_published": False}])],
+                                         {"date": "2025-07-07", "summary": "Invented minor issue", "severity": "minor", "postmortem_published": False}],
+                  ["On 2 February 2026 a major incident occurred; read the post-mortem.", "A minor issue on 7 July 2025."], "2 incidents")],
     "c9999_p3": [("security_certifications", [{"name": "ISO/IEC 27001", "status": "certified", "date": "2025-12-01", "valid_until": "2028-11-30",
                                                "issuer": "Invented Cert Body", "holder": "ACME, Inc"},
                                               {"name": "ISO 27701", "status": "certified", "date": "2025-12-01", "valid_until": "2028-11-30",
-                                               "issuer": "Invented Cert Body", "holder": "Acme Holdings Ltd"}])],
-    "c9999_p4": [("dpa_available", "sometimes")],            # an invalid enum: dropped on both paths
+                                               "issuer": "Invented Cert Body", "holder": "Acme Holdings Ltd"}],
+                  ["Certificate ISO/IEC 27001 held by ACME, Inc.", "Certificate ISO 27701 held by Acme Holdings Ltd."], "2 registry entries")],
+    "c9999_p4": [("dpa_available", "sometimes", "A DPA may be offered.", "DPA sometimes")],          # an invalid enum: dropped on both paths
+    # the newest official page answers from silence: the absence guard drops it on both paths (the display is the model's own wording)
+    "c9999_p5": [("sso_saml", "none", "Contact sales for plan details.", "SSO is not mentioned on this page")],
 }
 _FAMILY = {"security_certifications": "certifications", "data_regions": "data", "data_retention": "data", "dpa_available": "data",
            "trains_on_customer_data": "ai", "subprocessors": "ai", "sso_saml": "access_incidents", "security_incidents": "access_incidents"}
@@ -130,23 +145,25 @@ _LIST = {"security_certifications", "subprocessors", "security_incidents"}
 
 
 def _page(meta):
-    return {**meta, "title": "t", "published_date": meta["last_updated"], "text": "invented page text " * 5}
+    return {**meta, "title": "t", "text": "invented page text " * 5}
 
 
-def _claims_of(pid):          # the baseline shape: one Claim per field, a list field holds all of its items
-    return [Claim(field=f, value=v, display=str(v)[:120], quote="q") for f, v in _STATEMENTS[pid]]
+def _claims_of(pid, quote=None):          # the baseline shape: one Claim per field statement, a list field holds all of its items
+    return [Claim(field=f, value=v, display=d, quote=quote or (" ".join(q) if f in _LIST else q)) for f, v, q, d in _STATEMENTS[pid]]
 
 
-def _chosen():                # the specialist shape: one reading per list item
+def _chosen(quote=None, display=True):    # the specialist shape: one reading per list item
     out = {}
     for pid, stmts in _STATEMENTS.items():
-        for f, v in stmts:
-            items = v if f in _LIST else [v]
-            out[(pid, f)] = [reading(f, item, page_id=pid, n=i, family=_FAMILY[f]) for i, item in enumerate(items)]
+        for f, v, q, d in stmts:
+            items, quotes = (v, q) if f in _LIST else ([v], [q])
+            rs = out.setdefault((pid, f), [])
+            for item, iq in zip(items, quotes):
+                rs.append(reading(f, item, page_id=pid, n=len(rs), family=_FAMILY[f], quote=quote or iq, display=d if display else ""))
     return out
 
 
-RECS = [{"page": _page(m), "role": _ROLES[m["page_id"]], "why": "", "quarantine": [], "extract": None} for m in (_OLD, _NEW, _REG, _BAD)]
+RECS = [{"page": _page(m), "role": _ROLES[m["page_id"]], "why": "", "quarantine": [], "extract": None} for m in (_OLD, _NEW, _REG, _BAD, _SILENT)]
 CLAIMS = {pid: _claims_of(pid) for pid in _STATEMENTS}
 CHOSEN = _chosen()
 
@@ -163,11 +180,43 @@ def test_equivalence_fixture_is_non_trivial():
     assert set(certs) == {"SOC 2 Type II", "ISO 27001"}                  # older official "SOC 2" superseded; foreign holder dropped
     assert certs["ISO 27001"]["valid_until"] == "2028-11-30" and "holder" not in certs["ISO 27001"]
     assert facts["security_certifications"]["evidence_level"] == "documented"
-    assert facts["sso_saml"] == {"value": "enterprise_only"}             # the newer official page wins
+    assert facts["sso_saml"] == {"value": "enterprise_only"}             # newer by last_updated wins; the silent newest page is dropped
     assert facts["trains_on_customer_data"] == {"value": "no_on_paid_plans"}
     assert [s["name"] for s in facts["subprocessors"]["value"]] == ["CloudCo", "ModelCo", "MailCo"]
     assert len(facts["security_incidents"]["value"]) == 2
     assert facts["dpa_available"] == {"value": "on_request"}             # the invalid enum on the other page never took part
+    assert facts["data_regions"] == {"value": {"available": ["United States", "Germany"], "planned": ["India"]}}   # derived region dropped
+
+
+def test_equivalence_detects_a_constant_quote():
+    # with one constant quote the sub-processor line no longer names MailCo, so its "Ireland" survives: on both paths
+    base = facts_for_case(CASE, RECS, CHOSEN)[0]
+    mutated = facts_for_case(CASE, RECS, _chosen(quote="zzz"))[0]
+    assert mutated != base and "Ireland" in mutated["data_regions"]["value"]["available"]
+    assert mutated == assemble_case_facts_from_claims(CASE, RECS, {pid: _claims_of(pid, quote="zzz") for pid in _STATEMENTS})
+
+
+def test_equivalence_detects_the_wrong_page_date(monkeypatch):
+    base = facts_for_case(CASE, RECS, CHOSEN)[0]
+    monkeypatch.setattr(adapter.kp, "page_date", lambda p: str(p.get("published_date") or "")[:10])
+    mutated = facts_for_case(CASE, RECS, CHOSEN)[0]
+    assert mutated != base and mutated["sso_saml"] == {"value": "paid_plans"}
+
+
+def test_equivalence_detects_a_missing_display():
+    # without the model's display the guard falls back to the quote, which is not absence-worded: the silent "none" survives
+    mutated = facts_for_case(CASE, RECS, _chosen(display=False))[0]
+    assert mutated["sso_saml"] == {"value": "none"} and mutated != facts_for_case(CASE, RECS, CHOSEN)[0]
+
+
+def test_absence_worded_negative_is_dropped_and_a_real_negative_is_kept():
+    rec = RECS[1]
+    for display, quote in (("SSO is not mentioned", "Contact sales."), ("", "SSO is not mentioned on this page.")):
+        pc, notes = to_page_claims([reading("sso_saml", "none", page_id="c9999_p2", quote=quote, display=display)], rec, "Acme Inc.")
+        assert pc.claims == [] and any("sso_saml" in n for n in notes)
+    pc, notes = to_page_claims([reading("sso_saml", "none", page_id="c9999_p2", quote="Acme does not offer single sign-on.",
+                                        display="Acme does not offer SSO")], rec, "Acme Inc.")
+    assert [(c.field, c.value) for c in pc.claims] == [("sso_saml", "none")] and notes == []
 
 
 def test_adapter_returns_notes_and_conflicts():
@@ -239,7 +288,7 @@ def test_read_page_forces_the_page_id_and_returns_reading_dicts(tmp_path):
     assert [x["page_id"] for x in r] == ["p1", "p1", "p1"]
     assert [x["id"] for x in r] == ["1:ai:p1:subprocessors:0", "1:ai:p1:subprocessors:1", "1:ai:p1:trains_on_customer_data:0"]
     assert r[0] == {"id": "1:ai:p1:subprocessors:0", "iteration": 1, "family": "ai", "page_id": "p1", "field": "subprocessors",
-                    "value": {"name": "A", "category": "hosting"}, "quote": "q1"}
+                    "value": {"name": "A", "category": "hosting"}, "quote": "q1", "display": ""}
     system, user, schema = llm.calls[0]
     assert system == SPECIALIST_SYSTEM["ai"] and user == page_user_prompt(PAGE) and schema is SpecialistRaw
 
@@ -363,3 +412,29 @@ def test_no_page_text_reaches_adapter_notes():
     assert len(notes) >= 3 and not any(CANARY in n for n in notes)
     facts, notes, conflicts = facts_for_case(CASE, [RECS[2]], {("c9999_p3", "x"): readings})
     assert not any(CANARY in n for n in notes + conflicts)
+
+
+# ------------------------------------------------------------------------------------------------ fix round 1
+def test_no_incidents_reading_survives_validation(tmp_path):
+    out = SpecialistRaw(readings=[{"field": "security_incidents", "value": [], "quote": "We have had no security incidents."}])
+    r, notes = read_page(StubLLM(out), CallCache(tmp_path), "access_incidents", PAGE)
+    assert [(x["field"], x["value"]) for x in r] == [("security_incidents", [])] and notes == []
+    facts = facts_for_case(CASE, [REC_OFFICIAL], {("p1", "security_incidents"): r})[0]
+    assert facts["security_incidents"] == {"value": []}
+
+
+def test_read_page_carries_the_model_display(tmp_path):
+    out = SpecialistRaw(readings=[{"field": "sso_saml", "value": "none", "quote": "q", "display": "SSO is not mentioned"},
+                                  {"field": "sso_saml", "value": "none", "quote": "q", "display": None}])
+    r, _ = read_page(StubLLM(out), CallCache(tmp_path), "access_incidents", PAGE)
+    assert [x["display"] for x in r] == ["SSO is not mentioned", ""]
+
+
+def test_short_foreign_page_id_is_echoed_and_a_long_one_is_not(tmp_path):
+    out = SpecialistRaw(readings=[{"page_id": "c0001_p12", "field": "sso_saml", "value": "none", "quote": "q"},
+                                  {"page_id": CANARY, "field": "sso_saml", "value": "none", "quote": "q"},
+                                  {"page_id": "x" * 40, "field": "sso_saml", "value": "none", "quote": "q"}])
+    r, notes = read_case(StubLLM(out), CallCache(tmp_path), "access_incidents", [PAGE], ["sso_saml"])
+    assert r == [] and "c0001_p12" in notes[0]
+    assert not any(CANARY in n for n in notes) and any("<16 chars>" in n for n in notes) and any("<40 chars>" in n for n in notes)
+
