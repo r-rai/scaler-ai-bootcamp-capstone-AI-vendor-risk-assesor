@@ -15,7 +15,7 @@ Failure handling: a failed local or MiniMax call never stops a case. It is count
     ids are in `notes` as "specialists: failed page <id>" and in the trace), case_read_failures (failed iteration-2 case reads, noted
     as "specialists: case read failed: <family>"; the iteration-1 readings stand, so no page counts as failed), grader_failures
     (graded "unsure"), decision_failures (a failed call, abstained), decision_invalid (an answer outside the candidates, abstained).
-`BudgetExceeded` always propagates.
+`BudgetExceeded` and `quota.QuotaExhausted` (a BaseException: a quota window that outlasted the retry ladder) always propagate.
 
 Trace: every node calls `state["trace"].handover` exactly once per execution, with counts, ids, field and family names and verdict labels
 only: never a quote, a value, display text, a title, a URL, page text, model output or an exception message. Notes follow the same rule

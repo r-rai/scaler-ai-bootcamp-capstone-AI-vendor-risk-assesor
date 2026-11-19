@@ -20,6 +20,7 @@ from vendor_verdict.agents.router import injection_second_opinion, tag_pages
 from vendor_verdict.cache import CallCache
 from vendor_verdict.config import FAMILIES
 from vendor_verdict.prompts import PLANNER_SYSTEM, ROUTER_SYSTEM, page_user_prompt, version
+from vendor_verdict.quota import QuotaExhausted
 from vendor_verdict.safe import family_name, safe_id
 from vendor_verdict.schemas import PageRoute, PlanOut, RouterOut
 
@@ -281,7 +282,8 @@ def test_planner_retries_only_a_rate_limit(tmp_path, monkeypatch):
     slept = []
     monkeypatch.setattr(planner_mod, "_sleep", slept.append)
     llm = RaisingLLM(LLMError("HTTP 429 too many requests"))
-    assert plan_routes(llm, CallCache(tmp_path), CASE, [rec("p1")]) == ({}, ["planner failed"])
+    with pytest.raises(QuotaExhausted):               # Task 8C: after the ladder a persistent 429 is a quota stop, not "planner failed"
+        plan_routes(llm, CallCache(tmp_path), CASE, [rec("p1")])
     assert llm.calls == 5 and len(slept) == 4
     llm = RaisingLLM()
     plan_routes(llm, CallCache(tmp_path), CASE, [rec("p1")])

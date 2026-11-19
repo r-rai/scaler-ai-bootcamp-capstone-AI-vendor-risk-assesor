@@ -2,7 +2,7 @@
 
     python -m vendor_verdict run --split test|train --subset all|dev|holdout [--limit N] [--only ids] [--cache-only] [--estimate]
         [--salt S] [--engine plain|langgraph] [--ablate router,grader,decision_maker,iteration2] [--workers 6] [--out DIR]
-        [--data DIR] [--max-usd X]
+        [--data DIR] [--max-usd X] [--wait-quota] [--quota-poll-minutes 10] [--quota-max-hours 6]
 
 Outputs in `--out` (default `reports/vendor_verdict/<split>_<subset>[_ablate-a+b][_salt-S]/`):
 - `preds.csv` (id, verdict) for every finished case, in case-id order (never completion order), so a cache-only rerun is byte-identical;
@@ -22,7 +22,18 @@ The assessor's own LLM answer cache (`assessor.cache`) is switched off process-w
 `run` and of `build_agents`, whatever was imported first: its key has no salt (a salted run would replay unsalted answers) and it
 would store competition page text under runs/cache. The agents' CallCache is the only cache.
 
-Console output is counts, model names and case ids only: never page text, a reading, a note or an exception message (class names only).
+Quota window (vendor_verdict.quota; the wording of MiniMax's quota error is UNVERIFIED): a paid call whose quota-kind error outlasts
+the agents' retry ladder raises `QuotaExhausted`. By default the run then stops cleanly (stopped_reason "quota"; finished cases are
+written, the rest are pending, no submission). With `--wait-quota` the workers wait at a shared gate and one probe case per poll
+interval tests the window, up to `--quota-max-hours`. A resume is the same command again: every successful call is cached.
+
+Exit status: 0 complete; 1 complete but the submission self-check found problems; 3 any other partial run (budget, failed pages,
+case errors, cache-only misses, unfinished cases); 75 (EX_TEMPFAIL) a quota stop; 130 interrupted. To retry only quota stops:
+    while :; do python -m vendor_verdict run ...; rc=$?; [ $rc -eq 75 ] || break; sleep 600; done
+(`until ...; do sleep 600; done` would also loop on a deterministic partial run, exit 3, forever.)
+
+Console output is counts, model names and case ids only: never page text, a reading, a note or an exception message (class names only;
+the provider's quota message goes to run.json only).
 """
 from __future__ import annotations
 
@@ -36,6 +47,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -54,6 +66,7 @@ from .cache import CallCache
 from .config import FAMILIES, GRADER_FIELDS, LOCAL_SCOPE, ROOT
 from .graph import build_langgraph, mermaid, new_state, run_plain
 from .nodes import ABLATIONS, FAILED_PAGE_NOTE, FLAG_KEYS, Agents, _readable_pages
+from .quota import QuotaExhausted, QuotaGate
 from .prompts import DECISION_SYSTEM, GRADER_SYSTEM, PLANNER_SYSTEM, ROUTER_SYSTEM, SPECIALIST_SYSTEM, page_user_prompt, version
 from .safe import safe_id
 from .trace import Trace
@@ -66,13 +79,54 @@ _FLAG_ROLE = {"planner_failures": "planner", "specialist_failures": "specialist"
               "router_fallbacks": "router", "grader_failures": "grader", "decision_failures": "decision_maker",
               "decision_invalid": "decision_maker"}
 _OUTPUTS = ("submission.csv", "run.json", "preds.csv", "graph.mmd")
-# Exceptions that mean "abandon this case, start no new case, finish cleanly" (the case writes no preds or trace). Task 8C adds its
-# quota exception here; `_stop_name` gives the run.json `stopped` / `stopped_reason` value of each.
-STOP_EXCEPTIONS: tuple[type[BaseException], ...] = (BudgetExceeded,)
+# Exceptions that mean "abandon this case, start no new case, finish cleanly" (the case writes no preds or trace); `_stop_name` gives
+# the run.json `stopped` / `stopped_reason` value of each. A QuotaExhausted reaches the runner only in STOP mode or when WAIT mode gave
+# up (the gate restarts the case otherwise).
+STOP_EXCEPTIONS: tuple[type[BaseException], ...] = (BudgetExceeded, QuotaExhausted)
+EXIT_OK, EXIT_SUBMISSION_PROBLEMS, EXIT_PARTIAL, EXIT_QUOTA, EXIT_INTERRUPTED = 0, 1, 3, 75, 130
 
 
 def _stop_name(exc: BaseException) -> str:
-    return "budget" if isinstance(exc, BudgetExceeded) else type(exc).__name__.lower()
+    if isinstance(exc, BudgetExceeded):
+        return "budget"
+    return "quota" if isinstance(exc, QuotaExhausted) else type(exc).__name__.lower()
+
+
+def exit_code(rj: dict) -> int:
+    """The CLI's exit status (see the module docstring): 130 interrupted, 75 quota stop, 3 other partial, 1 submission problems, 0."""
+    if rj.get("stopped") == "interrupted":
+        return EXIT_INTERRUPTED
+    if rj.get("stopped") == "quota":
+        return EXIT_QUOTA
+    if rj.get("partial"):
+        return EXIT_PARTIAL
+    return EXIT_SUBMISSION_PROBLEMS if (rj.get("submission") or {}).get("problems") else EXIT_OK
+
+
+def error_frames(exc: BaseException, limit: int = 12) -> list[str]:
+    """The traceback's frames in repo files as "path:line" (never the message, never a local value): enough to locate a bug. Frames
+    in the virtualenv, site-packages or outside the repo are left out."""
+    out = []
+    for fr in traceback.extract_tb(exc.__traceback__):
+        try:
+            rel = Path(fr.filename).resolve().relative_to(ROOT)
+        except (ValueError, OSError):
+            continue
+        if rel.parts and (rel.parts[0] in (".venv", "venv") or "site-packages" in rel.parts):
+            continue
+        out.append(f"{rel.as_posix()}:{fr.lineno}")
+    return out[-limit:]
+
+
+def previous_resume_count(out: Path) -> int:
+    """resume_count of a run into `out`: the earlier run.json's resume_count + 1, or 0 when there is none (unreadable: counts as 0)."""
+    path = Path(out) / "run.json"
+    if not path.exists():
+        return 0
+    try:
+        return _int(json.loads(path.read_text(encoding="utf-8")).get("resume_count", 0)) + 1
+    except (OSError, ValueError, AttributeError):
+        return 1
 
 
 def role_of(name: str) -> str:
@@ -199,10 +253,12 @@ class RunStopped(BaseException):
 
 
 class GuardedLLM:
-    """Forwards to a model, counting the calls sent per stage; refuses every call in a cache-only run or once the run is stopping."""
+    """Forwards to a model, counting the calls sent per stage; refuses every call in a cache-only run or once the run is stopping.
+    A paid model also gets the run's QuotaGate: while the quota window is closed only the probe's calls reach the provider (any other
+    call raises QuotaExhausted at once, and is not counted)."""
 
-    def __init__(self, llm, cache_only: bool, stop: threading.Event):
-        self._llm, self._cache_only, self._stop = llm, cache_only, stop
+    def __init__(self, llm, cache_only: bool, stop: threading.Event, gate: QuotaGate | None = None):
+        self._llm, self._cache_only, self._stop, self._gate = llm, cache_only, stop, gate
         self._lock = threading.Lock()
         self.calls: Counter = Counter()
         self.not_cached: Counter = Counter()
@@ -217,6 +273,11 @@ class GuardedLLM:
     def structured(self, system, user, schema, *args, stage: str = "", **kw):
         if self._stop.is_set():
             raise RunStopped()
+        if self._gate is not None and not self._cache_only:
+            with self._gate.admit():
+                with self._lock:
+                    self.calls[role_of(stage)] += 1
+                return self._llm.structured(system, user, schema, *args, stage=stage, **kw)
         with self._lock:
             (self.not_cached if self._cache_only else self.calls)[role_of(stage)] += 1
         if self._cache_only:
@@ -393,6 +454,9 @@ def format_estimate(est: dict) -> list[str]:
     lines.append(f"  grader [local]: readings expected {g['readings_expected'] if g['readings_expected'] is not None else 'unknown'} "
                  f"({g['basis']})")
     lines.append(f"  decision maker [local]: {est['decision_maker']['basis']}")
+    lines.append("  quota window [paid]: its size is unknown to the runner; the user reports that earlier passes used under half of "
+                 "a 5-hour window (their statement, unmeasured); a quota stop is resumable (the same command again; finished calls "
+                 "are cached)")
     return lines
 
 
@@ -415,10 +479,14 @@ def _run_case(case: dict, pages: list[dict], ag: Agents, app) -> dict:
 
 # ------------------------------------------------------------------------------------------------ the run
 def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | None = None, only: list[str] | None = None,
-        cache_only: bool = False, engine: str = "plain", workers: int = 6, metric=None, budget=None, say=print) -> dict:
+        cache_only: bool = False, engine: str = "plain", workers: int = 6, metric=None, budget=None, say=print,
+        wait_quota: bool = False, quota_poll_minutes: float = 10.0, quota_max_hours: float = 6.0, quota_clock=None,
+        quota_sleep=None) -> dict:
     """Run the selected cases and write the outputs into `out`; returns the run.json dict. `agents` holds the models (the seam tests
     stub), the cache, rules_lite, the requirements, the baseline, the salt and the ablations. `metric` is the host's metric module
-    (loaded from the data dir when a submission is written and none is given); `budget` (optional) is reported in `spend`."""
+    (loaded from the data dir when a submission is written and none is given); `budget` (optional) is reported in `spend`.
+    `wait_quota`, `quota_poll_minutes`, `quota_max_hours`: the QuotaGate's mode (vendor_verdict.quota); `quota_clock` and
+    `quota_sleep` replace its clock and its sleep (tests; the default sleep waits on the run's stop event, so Ctrl-C ends it)."""
     if engine not in ("plain", "langgraph"):
         raise ValueError(f"unknown engine {engine!r}")
     t_start = time.perf_counter()
@@ -429,14 +497,18 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
     for line in format_estimate(estimate(cases, pages, ids, agents)):
         say(line)
 
+    resume_count = previous_resume_count(out)            # before the stale outputs go
     out.mkdir(parents=True, exist_ok=True)
     for name in _OUTPUTS:                               # no stale output may survive into this run's folder
         (out / name).unlink(missing_ok=True)
     shutil.rmtree(out / "traces", ignore_errors=True)
 
     stop = threading.Event()
+    gate = QuotaGate(wait=wait_quota, poll_seconds=float(quota_poll_minutes) * 60, max_seconds=float(quota_max_hours) * 3600,
+                     stop=stop, clock=quota_clock, sleep=quota_sleep, abort_exc=RunStopped)
     cache = RoleCache(Path(agents.cache.root))
-    llms = {k: GuardedLLM(getattr(agents, k), cache_only, stop) for k in ("main_llm", "reader_llm", "local_llm")}
+    llms = {k: GuardedLLM(getattr(agents, k), cache_only, stop, gate if k != "local_llm" else None)    # local roles: no quota
+            for k in ("main_llm", "reader_llm", "local_llm")}
     ag = replace(agents, cache=cache, **llms)
     app = build_langgraph(ag) if engine == "langgraph" else None
     mode = (["cache-only"] if cache_only else []) + (["salted"] if ag.salt else []) + \
@@ -445,14 +517,17 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
 
     results: dict[str, dict] = {}
     errors: dict[str, str] = {}
+    frames: dict[str, list[str]] = {}
     stopped: str | None = None
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
-    futs = {pool.submit(_run_case, cases[cid], pages[cid], ag, app): cid for cid in ids}
+    # the gate restarts a case after a quota error in WAIT mode (from the top: every finished call is a cache hit)
+    futs = {pool.submit(gate.run_case, lambda c=cid: _run_case(cases[c], pages[c], ag, app)): cid for cid in ids}
 
     def halt(reason: str) -> None:
         nonlocal stopped
         stopped = stopped or reason
-        stop.set()
+        stop.set()                                      # in-flight cases end at their next model call (RunStopped)
+        gate.abort()                                    # and every worker waiting at the quota gate wakes
         for f in futs:
             f.cancel()
 
@@ -479,8 +554,11 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         exc = fut.exception()
         if exc is None:
             results[cid] = fut.result()
-        elif not isinstance(exc, (*STOP_EXCEPTIONS, KeyboardInterrupt, RunStopped)):
+        elif not isinstance(exc, (*STOP_EXCEPTIONS, QuotaExhausted, KeyboardInterrupt, RunStopped)):
             errors[cid] = type(exc).__name__            # a bug in one case: counted by class name only, the other cases go on
+            frames[cid] = error_frames(exc)             # and located by its repo frames (path:line, never the message)
+    if gate.stopped and stopped is None:
+        stopped = "quota"                               # defensive: a gate that stopped always also raised into a future
 
     # ---- aggregate (counts only) ----
     finished = sorted(results)
@@ -555,6 +633,7 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         "cases": {"selected": len(ids), "finished": len(finished), "errors": len(errors), "unfinished": len(unfinished)},
         "cases_total": len(ids), "cases_done": len(finished), "cases_pending": len(unfinished),
         "case_errors": dict(sorted(Counter(errors.values()).items())), "error_case_ids": [safe_id(c) for c in sorted(errors)],
+        "error_frames": {safe_id(c): frames.get(c, []) for c in sorted(errors)},
         "unfinished_case_ids": [safe_id(c) for c in unfinished],
         "pages_readable": readable, "pages_read": readable - len(failed_pages) - unrouted, "pages_failed": len(failed_pages),
         "pages_unrouted": unrouted, "failed_page_ids": failed_pages,
@@ -571,13 +650,22 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
         "preds_rows": len(preds),
         "spend": None if budget is None else {"max_usd": budget.max_usd, "usd": _float(budget.spent_usd), "tokens_in": _int(budget.input_tokens),
                                               "tokens_out": _int(budget.output_tokens), "llm_calls": _int(budget.llm_calls)},
+        "resume_count": resume_count,
+        "quota": gate.block(),
         "wall_seconds": round(time.perf_counter() - t_start, 3),
     }
     (out / "run.json").write_text(_dump(rj), encoding="utf-8")
 
-    say(f"finished {len(finished)}/{len(ids)} cases; readable pages {readable}, read {rj['pages_read']}, failed {len(failed_pages)}, "
+    say(f"finished {len(finished)}/{len(ids)} cases (pending {len(unfinished)}, errors {len(errors)}); readable pages {readable}, read {rj['pages_read']}, failed {len(failed_pages)}, "
         f"unrouted {unrouted}; failures {rj['failures']}; iteration-2 cases {rj['iteration2_cases']}")
     say("local fallbacks: " + ", ".join(f"{k} {v}" for k, v in rj["local_fallbacks"].items()))
+    q = rj["quota"]
+    if q is not None:                                   # status and kind only: the provider's message is in run.json
+        say(f"quota: kind {q['kind']}, status {q['status'] if q['status'] is not None else 'none'}; wait mode "
+            f"{'on' if q['wait_mode'] else 'off'}, probes {q['probes']}, waited {q['waited_seconds']:.0f} s")
+    if stopped == "quota":
+        say(f"quota window exhausted: {len(finished)} of {len(ids)} cases finished; run the same command again to resume "
+            "(finished calls are cached)")
     if partial:
         say("PARTIAL run (" + ", ".join(reasons) + "): no submission.csv; the gates refuse it")
         if errors:
@@ -644,6 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="optional cap on spend at the configured prices; default: no cap. A run that hits it stops as partial "
                         "(stopped_reason budget). The cap is checked after the provider answers, so the call that crosses it is "
                         "paid for and never cached.")
+    r.add_argument("--wait-quota", action="store_true",
+                   help="on an exhausted quota window, wait and probe (one case per poll) instead of stopping (exit 75)")
+    r.add_argument("--quota-poll-minutes", type=float, default=10.0, help="minutes between quota probes with --wait-quota")
+    r.add_argument("--quota-max-hours", type=float, default=6.0, help="total wait with --wait-quota before stopping as a quota stop")
     r.add_argument("--out", default="")
     return ap
 
@@ -663,10 +755,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     out = Path(a.out) if a.out else default_out(a.split, a.subset, ablate, a.salt)
     rj = run(data_dir, a.split, a.subset, agents=ag, out=out, limit=a.limit or None, only=only, cache_only=a.cache_only,
-             engine=a.engine, workers=a.workers, metric=metric, budget=budget)
-    if rj["stopped"] == "interrupted":
-        return 130
-    return 1 if rj["submission"]["problems"] else 0
+             engine=a.engine, workers=a.workers, metric=metric, budget=budget, wait_quota=a.wait_quota,
+             quota_poll_minutes=a.quota_poll_minutes, quota_max_hours=a.quota_max_hours)
+    return exit_code(rj)
 
 
 if __name__ == "__main__":

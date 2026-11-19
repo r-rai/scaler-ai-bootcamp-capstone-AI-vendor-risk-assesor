@@ -7,6 +7,7 @@ Trust rules:
 - A reading's page id is never taken on trust: a single-page read forces the page's own id; a case read keeps only ids of the
   pages it was given (a `page_id:` line could also appear inside page text).
 - Notes carry field names, page ids and exception class names only, never a quote, a value or page text.
+- A quota-kind error that outlasts the retry ladder raises `quota.QuotaExhausted` (never a failed page): the runner stops or waits.
 """
 from __future__ import annotations
 
@@ -15,12 +16,12 @@ import time
 
 from pydantic import BaseModel, ValidationError
 
-from assessor.llm import LLMError
-from assessor.tracing import BudgetExceeded, estimate_tokens
+from assessor.tracing import estimate_tokens
 
 from ..cache import CallCache
 from ..config import FAMILIES, FIELD_FAMILY
 from ..prompts import SPECIALIST_SYSTEM, page_user_prompt, version
+from ..quota import call_with_ladder
 from ..safe import safe_id as _safe_id
 from ..schemas import FieldReading, SpecialistRaw
 from ..state import reading_id
@@ -45,20 +46,10 @@ def _call(llm, cache: CallCache, family: str, user: str, salt: str) -> tuple[lis
     rec = cache.get(key)
     if rec is not None and isinstance(rec.get("readings"), list):
         return rec["readings"], []
-    res, err = None, None
-    for attempt in range(_ATTEMPTS):
-        try:
-            res = llm.structured(system, user, SpecialistRaw, stage=f"specialist:{family}")
-            break
-        except BudgetExceeded:
-            raise
-        except LLMError as exc:
-            err = exc
-            msg = str(exc)
-            if "429" not in msg and "rate limit" not in msg.lower():
-                break                                   # only a rate limit is worth waiting for (Extractor.run pattern)
-            if attempt < _ATTEMPTS - 1:
-                _sleep(min(60, 4 * 3 ** attempt))       # 4, 12, 36, 60 s
+    # only a quota-kind error (a 429 / rate limit, or a quota keyword) is worth waiting for: 4, 12, 36, 60 s; after the ladder it
+    # raises QuotaExhausted (a BaseException: never a failed page). BudgetExceeded is not an LLMError, so it propagates.
+    res, err = call_with_ladder(lambda: llm.structured(system, user, SpecialistRaw, stage=f"specialist:{family}"), _ATTEMPTS,
+                                lambda s: _sleep(s))
     if res is None:
         return None, [f"failed: {type(err).__name__}"]
     raw = [r.model_dump(mode="json") if isinstance(r, BaseModel) else r for r in res.readings]

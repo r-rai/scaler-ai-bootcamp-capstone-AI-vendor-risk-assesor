@@ -9,19 +9,20 @@ Trust rules:
   is dropped with a note. The reply is cached raw and validated on every read, so a cache hit gives the same notes.
 - Notes carry page ids (only id-shaped values), family names from the fixed list and the fixed phrase "planner failed", never
   metadata, page text, model output or an exception message.
+- A quota-kind error that outlasts the retry ladder raises `quota.QuotaExhausted`, never "planner failed".
 """
 from __future__ import annotations
 
 import json
 import time
 
-from assessor.llm import LLMError
-from assessor.tracing import BudgetExceeded, estimate_tokens
+from assessor.tracing import estimate_tokens
 from eval import run_kaggle as rk
 
 from ..cache import CallCache
 from ..config import FAMILIES
 from ..prompts import PLANNER_SYSTEM, version
+from ..quota import call_with_ladder
 from ..safe import family_name, safe_id
 from ..schemas import PlanOut
 
@@ -58,19 +59,8 @@ def _call(llm, cache: CallCache, user: str, case_id: str, salt: str) -> list | N
     rec = cache.get(key)
     if rec is not None and isinstance(rec.get("routes"), list):
         return rec["routes"]
-    res = None
-    for attempt in range(_ATTEMPTS):
-        try:
-            res = llm.structured(PLANNER_SYSTEM, user, PlanOut, stage="planner")
-            break
-        except BudgetExceeded:
-            raise
-        except LLMError as exc:
-            msg = str(exc)
-            if "429" not in msg and "rate limit" not in msg.lower():
-                break                                   # only a rate limit is worth waiting for (Extractor.run pattern)
-            if attempt < _ATTEMPTS - 1:
-                _sleep(min(60, 4 * 3 ** attempt))       # 4, 12, 36, 60 s
+    # only a quota-kind error is retried (4, 12, 36, 60 s); after the ladder it raises QuotaExhausted, never "planner failed"
+    res, _ = call_with_ladder(lambda: llm.structured(PLANNER_SYSTEM, user, PlanOut, stage="planner"), _ATTEMPTS, lambda s: _sleep(s))
     if res is None:
         return None
     raw = json.loads(json.dumps([r.model_dump(mode="json") for r in res.routes], default=str))     # JSON-safe, detached from the model object

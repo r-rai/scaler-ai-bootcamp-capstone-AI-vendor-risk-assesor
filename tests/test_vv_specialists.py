@@ -16,6 +16,7 @@ from vendor_verdict.agents import specialists
 from vendor_verdict.agents.specialists import read_case, read_page
 from vendor_verdict.cache import CallCache
 from vendor_verdict.prompts import SPECIALIST_SYSTEM, page_user_prompt
+from vendor_verdict.quota import QuotaExhausted
 from vendor_verdict.schemas import FieldReading, SpecialistOut, SpecialistRaw
 from vendor_verdict.state import reading_id
 
@@ -335,8 +336,9 @@ def test_only_a_rate_limit_is_retried(tmp_path, monkeypatch):
     slept = []
     monkeypatch.setattr(specialists, "_sleep", slept.append)
     llm = RaisingLLM(LLMError("HTTP 429 too many requests"))
-    r, notes = read_page(llm, CallCache(tmp_path), "ai", PAGE)
-    assert llm.calls == 5 and len(slept) == 4 and r == [] and notes == ["failed: LLMError"]
+    with pytest.raises(QuotaExhausted):               # Task 8C: after the ladder a persistent 429 is a quota stop, not a failed page
+        read_page(llm, CallCache(tmp_path), "ai", PAGE)
+    assert llm.calls == 5 and len(slept) == 4
     llm = RaisingLLM()
     read_page(llm, CallCache(tmp_path), "ai", PAGE)
     assert llm.calls == 1
