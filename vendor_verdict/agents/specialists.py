@@ -11,7 +11,6 @@ Trust rules:
 from __future__ import annotations
 
 import json
-import re
 import time
 
 from pydantic import BaseModel, ValidationError
@@ -22,6 +21,7 @@ from assessor.tracing import BudgetExceeded, estimate_tokens
 from ..cache import CallCache
 from ..config import FAMILIES, FIELD_FAMILY
 from ..prompts import SPECIALIST_SYSTEM, page_user_prompt, version
+from ..safe import safe_id as _safe_id
 from ..schemas import FieldReading, SpecialistRaw
 from ..state import reading_id
 
@@ -32,15 +32,6 @@ _ATTEMPTS = 5
 def payload(user: str, family: str) -> str:
     """The cache payload of one call: the user message plus the family."""
     return f"{user}\x00family:{family}"
-
-
-_ECHO_ID = re.compile(r"[A-Za-z0-9_.:-]{1,12}")       # a real page id is short (e.g. c0060_p12); longer text could be a page phrase
-
-
-def _safe_id(page_id) -> str:
-    """A page id fit for a note: a model-written id could carry page text, so only a short id-shaped value is echoed."""
-    text = str(page_id)
-    return text if _ECHO_ID.fullmatch(text) else f"<{len(text)} chars>"
 
 
 def _field_name(field) -> str:
