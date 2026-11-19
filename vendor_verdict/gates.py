@@ -56,10 +56,9 @@ Candidate rule. When R-smoke, R-hold and R-test pass, and R-route on the test ru
 with the ablation set of the final configuration: nothing; `decision_maker`; `router`; or `router` + `decision_maker`. Otherwise no
 candidate: B is not submitted, and the system is still presented with its honest numbers. A candidate always needs the user's yes to
 submit, and nothing here uploads anything. Final selection (submission #2 plus B, if B was submitted) is the user's call in the web
-UI. The runner writes submission.csv only for the ablation sets in its `SUBMISSION_ABLATIONS` (today: nothing, or
-`decision_maker`); the candidate file for a router-OFF configuration depends on that runner rule being extended to `router` and
-`router` + `decision_maker` (ruling R54, a separate change). Until then a router-OFF test run has no submission.csv, and R-test is
-not computable.
+UI. The runner writes submission.csv only for the ablation sets in its `SUBMISSION_ABLATIONS`: nothing, `decision_maker`, `router`,
+or `router` + `decision_maker` (ruling R54, committed before any holdout or test run); a test run with any other ablation set has no
+submission.csv, and R-test is then not computable.
 
 How the steps meet in gates.json. `--target holdout` records the router and Decision Maker configuration it chose. `--target test`
 reads that record and gates the test run in the same configuration (for example `test_all`, `test_all_ablate-router` or
@@ -111,7 +110,12 @@ Labels are read only to count.
 Exposed rows. The 7 holdout rows whose labels were exposed in an earlier session (`config.EXPOSED_HOLDOUT_ROWS`) are excluded from
 R-hold and R-DM. The test target uses no label at all.
 
-Frozen prompt versions: NOT YET RECORDED (Task 10 step 4)
+Frozen prompt versions (recorded at Task 10 step 4, 2026-11-20, after the dev smoke and before any holdout or test run; these are the
+versions the dev smoke ran under, and no prompt wording changes after this line):
+  planner b938cb38b6d8; router eebc4c12c2f7; grader 650ddd68e032; decision_maker 791af6bda801;
+  specialist:certifications f7c24db48c94; specialist:data 572c09b59ada; specialist:ai 8d6fb84ff155; specialist:access_incidents 6e7e78d2e88d.
+Dev-smoke facts recorded with the freeze (counts only, no label, no page text): 20 of 20 cases finished, 0 failures, all 149 readable pages
+read; R-route measured on those 20 cases was 158 of 163 (all 5 misses on one field), which is why the router fallback (R53) exists.
 """
 from __future__ import annotations
 
@@ -126,8 +130,17 @@ from typing import Callable
 from .config import EXPOSED_HOLDOUT_ROWS, ROOT
 from .runner import default_out
 
-# Filled at Task 10 step 4 ({role: prompt version}, as run.json `prompt_versions`); holdout and test refuse while it is None.
-FROZEN_PROMPT_VERSIONS: dict[str, str] | None = None
+# Recorded at Task 10 step 4 ({role: prompt version}, as run.json `prompt_versions`); holdout and test refuse on any mismatch.
+FROZEN_PROMPT_VERSIONS: dict[str, str] | None = {
+    "planner": "b938cb38b6d8",
+    "router": "eebc4c12c2f7",
+    "grader": "650ddd68e032",
+    "decision_maker": "791af6bda801",
+    "specialist:certifications": "f7c24db48c94",
+    "specialist:data": "572c09b59ada",
+    "specialist:ai": "8d6fb84ff155",
+    "specialist:access_incidents": "6e7e78d2e88d",
+}
 
 R_TEST_MAX_CHANGED = 30
 BASELINE_MODEL = "MiniMax-M3.1-Flash"        # the extractor model of submission #1 (prompt 9566ad4b6b95): s0 is pinned to it (R55b)

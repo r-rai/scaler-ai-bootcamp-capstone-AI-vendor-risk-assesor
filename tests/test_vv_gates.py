@@ -251,10 +251,14 @@ def test_dev_runs_without_frozen_prompts(monkeypatch):
 
 def test_the_module_docstring_is_the_pre_registration():
     doc = gates.__doc__
-    assert "Frozen prompt versions: NOT YET RECORDED (Task 10 step 4)" in doc
+    assert "Frozen prompt versions (recorded at Task 10 step 4" in doc
+    assert "NOT YET RECORDED" not in doc
     for word in ("R-smoke", "R-route", "R-hold", "R-DM", "R-test", "30", "refines", "exposed", "not computable"):
         assert word in doc
-    assert gates.FROZEN_PROMPT_VERSIONS is None
+    # Task 10 step 4 (the freeze): the docstring, the constant and the prompts the code really uses must all agree. Editing any prompt
+    # after the freeze fails this test on purpose.
+    assert gates.FROZEN_PROMPT_VERSIONS == runner.prompt_versions()
+    assert all(v in doc for v in gates.FROZEN_PROMPT_VERSIONS.values())
 
 
 def test_a_runner_made_run_json_passes_the_acceptance(tmp_path, monkeypatch):
