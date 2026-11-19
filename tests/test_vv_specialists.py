@@ -440,3 +440,107 @@ def test_short_foreign_page_id_is_echoed_and_a_long_one_is_not(tmp_path):
     assert r == [] and "c0001_p12" in notes[0]
     assert not any(CANARY in n for n in notes) and any("<16 chars>" in n for n in notes) and any("<40 chars>" in n for n in notes)
 
+
+
+# ------------------------------------------------------------------------------------------------ GATE-P (silence guards, notes)
+REC_NEW = RECS[1]                     # c9999_p2, official
+
+
+def _rid(field, n=0, pid="c9999_p2"):
+    return reading_id(1, "x", pid, field, n)
+
+
+def test_training_no_read_from_silence_is_dropped_with_its_reading_id_and_reason():
+    for display, quote in (("Training on customer data is not mentioned", "Acme builds invented tools."),
+                           ("", "The page does not state whether customer data is used for training.")):
+        for value in ("no", "No"):
+            pc, notes = to_page_claims([reading("trains_on_customer_data", value, page_id="c9999_p2", quote=quote, display=display)],
+                                       REC_NEW, "Acme Inc.")
+            assert pc.claims == []
+            assert notes == [f"c9999_p2: {_rid('trains_on_customer_data')}: dropped trains_on_customer_data: absence_statement"]
+
+
+def test_a_stated_no_training_is_kept():
+    pc, notes = to_page_claims([reading("trains_on_customer_data", "no", page_id="c9999_p2", quote="We never train models on customer data.",
+                                        display="Acme does not train models on customer data")], REC_NEW, "Acme Inc.")
+    assert [(c.field, c.value) for c in pc.claims] == [("trains_on_customer_data", "no")] and notes == []
+
+
+def test_no_incidents_read_from_silence_is_dropped_and_a_stated_none_is_kept():
+    silent = reading("security_incidents", [], page_id="c9999_p2", quote="Acme builds invented tools.",
+                     display="No incidents are mentioned on the page")
+    pc, notes = to_page_claims([silent], REC_NEW, "Acme Inc.")
+    assert pc.claims == [] and notes == [f"c9999_p2: {_rid('security_incidents')}: dropped security_incidents: absence_statement"]
+    facts = facts_for_case(CASE, [REC_NEW], {("c9999_p2", "security_incidents"): [silent]})[0]
+    assert "security_incidents" not in facts                                    # UNKNOWN, never the PASS an empty list gives
+    stated = reading("security_incidents", [], page_id="c9999_p2", quote="We have had no security incidents.",
+                     display="Acme reports no security incidents")
+    pc, notes = to_page_claims([stated], REC_NEW, "Acme Inc.")
+    assert [(c.field, c.value) for c in pc.claims] == [("security_incidents", [])] and notes == []
+
+
+def test_a_real_incident_with_absence_worded_display_is_kept():
+    inc = {"date": "2026-02-02", "summary": "Invented outage", "severity": "major", "postmortem_published": False}
+    pc, notes = to_page_claims([reading("security_incidents", inc, page_id="c9999_p2", quote="On 2 February 2026 a major outage occurred.",
+                                        display="major outage; no post-mortem is mentioned")], REC_NEW, "Acme Inc.")
+    assert [c.value[0]["severity"] for c in pc.claims] == ["major"] and notes == []
+
+
+def test_absence_wording_after_char_120_of_the_display_is_still_seen():
+    display = "Acme sells invented widgets in several colours and sizes, " * 3 + "single sign-on is not mentioned"
+    assert display.index("not mentioned") > 120 and len(display) < 300
+    pc, notes = to_page_claims([reading("sso_saml", "none", page_id="c9999_p2", quote="Contact sales.", display=display)], REC_NEW, "Acme Inc.")
+    assert pc.claims == [] and notes == [f"c9999_p2: {_rid('sso_saml')}: dropped sso_saml: absence_statement"]
+
+
+def test_adapter_notes_carry_the_reading_id_and_a_reason_word():
+    readings = [reading("dpa_available", "sometimes", page_id="c9999_p2"),
+                reading("sso_saml", "none", page_id="c9999_p2", display="SSO is not mentioned"),
+                reading("subprocessors", {"name": "MailCo", "category": "email", "country": "Ireland"}, page_id="c9999_p2",
+                        quote="MailCo sends email."),
+                reading("data_regions", {"available": ["Ireland"], "planned": []}, page_id="c9999_p2",
+                        quote="MailCo sends our email from Ireland."),
+                reading("dpa_available", "yes", page_id="c9999_p1", n=1)]
+    pc, notes = to_page_claims(readings, REC_NEW, "Acme Inc.")
+    assert [c.field for c in pc.claims] == ["subprocessors"]
+    assert notes == [f"c9999_p2: {_rid('dpa_available', n=1, pid='c9999_p1')}: dropped dpa_available: other_page",   # decided first
+                     f"c9999_p2: {_rid('dpa_available')}: dropped dpa_available: invalid_value",
+                     f"c9999_p2: {_rid('sso_saml')}: dropped sso_saml: absence_statement",
+                     f"c9999_p2: {_rid('data_regions')}: dropped data_regions: derived_region"]
+
+
+def test_registry_holder_notes_carry_the_reading_id_and_a_reason_word():
+    readings = [reading("security_certifications", {"name": "ISO 27001", "status": "certified"}, page_id="c9999_p3"),
+                reading("security_certifications", {"name": "ISO 27001", "status": "certified", "holder": "Other Corp"}, page_id="c9999_p3", n=1),
+                reading("security_certifications", {"name": "ISO 27001", "status": "certified", "holder": "ACME inc"}, page_id="c9999_p3", n=2)]
+    pc, notes = to_page_claims(readings, RECS[2], "Acme Inc.")
+    assert [len(c.value) for c in pc.claims] == [1]
+    assert notes == [f"c9999_p3: {_rid('security_certifications', 0, 'c9999_p3')}: dropped security_certifications: registry_no_holder "
+                     "(registry entry names no holder)",
+                     f"c9999_p3: {_rid('security_certifications', 1, 'c9999_p3')}: dropped security_certifications: registry_other_holder "
+                     "(certificate held by another entity than the legal entity)"]
+
+
+def test_an_incident_without_severity_leaves_the_field_unknown_with_a_reason_word():
+    inc = {"date": "2026-08-01", "summary": "Invented outage", "severity": None, "postmortem_published": False}
+    facts, notes, _ = facts_for_case(CASE, [REC_NEW], {("c9999_p2", "security_incidents"): [reading("security_incidents", inc, page_id="c9999_p2")]})
+    assert "security_incidents" not in facts
+    assert notes == ["security_incidents: left unknown by the merge: incident_without_severity"]
+
+
+def test_readings_of_a_page_outside_the_case_are_counted_not_lost_silently():
+    chosen = {("zz_p9", "sso_saml"): [reading("sso_saml", "none", page_id="zz_p9"), reading("sso_saml", "none", page_id="zz_p9", n=1)],
+              ("c9999_p2", "sso_saml"): [reading("sso_saml", "all_plans", page_id="c9999_p2")]}
+    facts, notes, _ = facts_for_case(CASE, [REC_NEW], chosen)
+    assert facts["sso_saml"] == {"value": "all_plans"}
+    assert notes == ["2 reading(s) cite a page that is not a page of this case: not merged (page_not_in_case)"]
+
+
+def test_adapter_notes_never_carry_a_display_and_a_long_reading_id_is_not_echoed():
+    readings = [reading("trains_on_customer_data", "no", page_id="c9999_p2", quote=f"{CANARY} q", display=f"{CANARY} is not mentioned"),
+                reading("sso_saml", "none", page_id="c9999_p2", quote=f"{CANARY} q", display=f"{CANARY} SSO is not stated"),
+                reading("security_incidents", [], page_id="c9999_p2", quote=f"{CANARY} q", display=f"no {CANARY} incidents mentioned"),
+                {**reading("dpa_available", CANARY, page_id="c9999_p2", quote=CANARY, display=CANARY), "id": CANARY * 9}]
+    pc, notes = to_page_claims(readings, REC_NEW, "Acme Inc.")
+    assert pc.claims == [] and len(notes) == 4 and not any(CANARY in n for n in notes)
+    assert f"<{len(CANARY) * 9} chars>" in notes[3]

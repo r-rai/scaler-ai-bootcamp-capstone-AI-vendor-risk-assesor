@@ -610,3 +610,22 @@ def test_both_engines_share_the_step_bound(monkeypatch):
     with pytest.raises(GraphRecursionError):
         build_langgraph(make_ag(grade="unsure")).invoke(b)
     assert len(a["trace"].to_json()["handovers"]) == len(b["trace"].to_json()["handovers"]) == graph_mod._MAX_STEPS
+
+
+# ---------------------------------------------------------------- GATE-P: display is page-derived text (item 5d)
+def test_a_short_display_canary_never_reaches_trace_notes_or_output(capsys):
+    short = f"{CANARY} is not mentioned"                         # under the trace's 80-character heuristic, and absence-worded
+    assert len(short) < 80
+    extra = {("ai", "p1"): [{"field": "trains_on_customer_data", "value": "no", "quote": "We do not train models on customer data.",
+                             "display": short}],
+             ("access_incidents", "p1"): [{"field": "security_incidents", "value": [], "quote": "Invented trust page.", "display": short},
+                                          {"field": "sso_saml", "value": "all_plans", "quote": "Single sign-on (SAML) is offered on every plan.",
+                                           "display": CANARY}]}
+    for engine in ("plain", "langgraph"):
+        ag = make_ag(grade="unsure", reader=ReaderLLM(extra=extra))
+        s = run_plain(new_state(CASE, PAGES), ag) if engine == "plain" else build_langgraph(ag).invoke(new_state(CASE, PAGES))
+        assert any("absence_statement" in n for n in s["notes"])               # the canary display went down the new note path
+        assert CANARY not in json.dumps(s["trace"].to_json()) and CANARY not in s["trace"].to_markdown()
+        assert not any(CANARY in n for n in s["notes"])
+    out = capsys.readouterr()
+    assert CANARY not in out.out and CANARY not in out.err

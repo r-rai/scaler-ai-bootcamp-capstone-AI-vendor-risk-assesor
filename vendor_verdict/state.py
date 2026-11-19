@@ -1,8 +1,10 @@
 """The shared state of one graph run (one case). Both engines (plain Python and LangGraph) pass this dict between nodes.
 
 A reading is one value a specialist read from one page:
-    {"id": str, "iteration": int, "family": str, "page_id": str, "field": str, "value": Any, "quote": str}
-and its id is built by `reading_id`, so every module that mints or looks up a reading uses the same format."""
+    {"id": str, "iteration": int, "family": str, "page_id": str, "field": str, "value": Any, "quote": str, "display": str}
+and its id is built by `reading_id`, so every module that mints or looks up a reading uses the same format. `display` is the
+specialist's own short statement ("" when it gave none); like `quote` it is page-derived text, read only by the adapter's absence
+guards, and must never reach a trace, a note or the console."""
 from __future__ import annotations
 
 from typing import TypedDict

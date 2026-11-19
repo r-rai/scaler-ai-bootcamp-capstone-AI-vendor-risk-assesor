@@ -6,7 +6,14 @@ brief. No wording comes from the baseline extraction prompt, and no example come
 
 Each prompt holds fixed rules only; the page arrives in the user message through `page_user_prompt`, which wraps it as
 untrusted data. The grader is the exception: its user message holds the field, the value and the quote of one reading, never the page
-(see agents/grader.py), and no guidance lives outside the prompt, so the prompt hash covers everything that steers the model. Prompts are kept short because each one is re-sent with every page.
+(see agents/grader.py), and no guidance lives outside the prompt, so the prompt hash covers everything that steers the model. One
+fixed line does live in a user message: an iteration-2 case read (agents/specialists.py `case_user_prompt`) opens with
+"Report only these fields: ..." built from the fixed field vocabulary, outside the untrusted wrapper; it is part of the cache payload,
+not of the prompt hash. Prompts are kept short because each one is re-sent with every page.
+
+GATE-P (pre-freeze review, the last wording change before the pre-registration): the display line no longer invites a reading from
+silence (rule 3), the certification status says when a mention is a claim (rule 4) and when it is no reading (claims.py: a status is
+never defaulted), and certificate dates are asked as YYYY-MM-DD (claims._iso reads nothing else) and never taken from the page dates.
 """
 from __future__ import annotations
 
@@ -22,7 +29,7 @@ Rules:
 - Report only what a page states. A field no page states is unknown: leave it out. Never guess or infer from silence.
 - Every reading needs a quote: a verbatim copy of the page sentence that states the value (exact text, no paraphrase).
 - If a `page_id:` line precedes a page block, copy that id into page_id of every reading taken from that page. With a single page and no such line, leave page_id as an empty string.
-- display: your own short statement of what the page says about the field; if the page only fails to mention it, say so.
+- display: your own short statement of what the page says about the field. A field the page does not mention gets no reading; a reading you give anyway must say in display that the page does not mention it.
 """
 
 _SPECIALIST_TAIL = """
@@ -32,10 +39,10 @@ _CERTIFICATIONS = """
 Field: security_certifications. One reading per certification. value is an object:
 {"name": ..., "status": ..., "date": ..., "valid_until": ..., "holder": ..., "issuer": ...}
 - name: "SOC 2 Type II" | "SOC 2 Type I" | "SOC 2" (type not stated) | "ISO 27001" | any other certification name.
-- status: "certified" | "in_progress".
-- date: the report or certificate date; valid_until: its expiry date (YYYY-MM-DD).
+- status: "certified" when the page says the certification is held, even without issuer or date (a claim) | "in_progress" when the page says it is being worked towards. A page that names a certification without saying it is held or being worked towards gives no reading for it.
+- date: the report or certificate date; valid_until: its expiry date; each as the page text states it, never copied from the Published or Last updated lines. Both as YYYY-MM-DD.
 - holder: the entity the page names as holder; issuer: the auditor or certification body. Give both whenever the page states them.
-- Use null for every key the page does not state.
+- Use null for every other key the page does not state.
 - A certification is DOCUMENTED when the page names the issuer and a report/certificate date. A bare "SOC 2 Type II" is a claim: report it with issuer and date null; never fill them in.
 """
 
