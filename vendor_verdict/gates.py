@@ -42,7 +42,8 @@ The rules, in that order.
   ablation set. The switch is part of the rule, not a later choice.
 - R-hold (holdout, the 7 exposed rows excluded), on the run in the final configuration. B's wrong rows are at most the wrong rows of
   the baseline sample s0, and B's false-confident rows are at most s0's, both counted over the same rows. s0 is the submitted
-  baseline: prompt 9566ad4b6b95, unsalted, rebuilt by `run_kaggle.assemble_case` over the cached baseline extraction (the path rule
+  baseline: extractor model MiniMax-M3.1-Flash (pinned as `BASELINE_MODEL`; any other configured extractor model is refused, and the
+  model name is recorded in the R-hold entry), prompt 9566ad4b6b95, unsalted, rebuilt by `run_kaggle.assemble_case` over the cached baseline extraction (the path rule
   R0 proved reproduces s0). If any holdout case has a readable page missing from that cache, s0 is refused (a missing page would
   make s0 look worse than it is). The rows are the gold rows of the holdout cases minus the exposed rows. A row with no prediction
   counts as wrong. A false-confident row is a requirement row (not OVERALL) whose gold label is UNKNOWN or NEEDS_REVIEW and whose
@@ -65,6 +66,18 @@ reads that record and gates the test run in the same configuration (for example 
 `test_all_ablate-decision_maker+router`); with no holdout record the router and the Decision Maker count as off (R45). A test entry
 made under another configuration than the current holdout record is stale and counts as failed. The candidate is recomputed from
 the merged gates.json on every call.
+
+Fresh inputs (ruling R55a). Each section of gates.json (dev, holdout, test) records the prompt versions of the runs it read and, for
+every run directory it consulted (accepted or refused), the sha256 of that directory's run.json, preds.csv and submission.csv (or
+"absent"). A section counts toward the candidate only while it is fresh: the frozen prompt versions are recorded, the section's prompt
+versions equal them, and every consulted directory still hashes the same. Otherwise the section is treated as missing (not
+computable, so FAIL under R45): a dev smoke on other prompts cannot stand in for B's prompts, and a run re-run after it was gated
+forces a re-gate. The test step also reads the holdout configuration only from a fresh holdout section.
+
+The record itself. gates.json has an append-only `history` list: every gate call appends one counts-only record (UTC time, target,
+configuration, each rule's pass and computable flags, the input directory names, the candidate name) and never rewrites an earlier
+one, so a re-gate stays visible. An unreadable gates.json, or one whose history is not a list, is refused (class name only) and left
+untouched, never silently replaced; an unknown target is refused before anything is read or written.
 
 Not computable (ruling R45). A rule whose input run is missing or refused is not computable, and a rule that is not computable counts
 as FAIL. For the holdout R-route and for R-DM that fail is the pre-registered switch above (router off, Decision Maker off). For
@@ -104,7 +117,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -115,6 +130,8 @@ from .runner import default_out
 FROZEN_PROMPT_VERSIONS: dict[str, str] | None = None
 
 R_TEST_MAX_CHANGED = 30
+BASELINE_MODEL = "MiniMax-M3.1-Flash"        # the extractor model of submission #1 (prompt 9566ad4b6b95): s0 is pinned to it (R55b)
+HASHED_FILES = ("run.json", "preds.csv", "submission.csv")
 DEV_LIMIT = 20
 TARGETS: dict[str, tuple[str, str]] = {"dev": ("train", "dev"), "holdout": ("train", "holdout"), "test": ("test", "all")}
 DM = frozenset({"decision_maker"})
@@ -123,6 +140,7 @@ REQUIRED = ("R-smoke", "R-route", "R-hold", "R-test")
 ABSTAIN_LABELS = frozenset({"UNKNOWN", "NEEDS_REVIEW"})
 CONFIDENT_LABELS = frozenset({"PASS", "FAIL"})
 EXIT_USAGE = 64
+EXIT_REFUSED = 2                             # the gates record is unreadable or the target unknown: nothing was written
 RUNS_ROOT = ROOT / "reports" / "vendor_verdict"
 SUBMISSION_2 = ROOT / "reports" / "kaggle_consensus" / "candidate" / "submission.csv"
 
@@ -298,14 +316,37 @@ def _route_rule(d: Path, run: dict) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ the targets
+def _sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def fingerprint(d: Path) -> dict:
+    """What a gate read from a run directory: its name, its path and the sha256 of each input file (None = absent) (R55a)."""
+    d = Path(d)
+    return {"dir": d.name, "path": str(d), **{name: _sha(d / name) for name in HASHED_FILES}}
+
+
+def section_fresh(sec: dict | None) -> bool:
+    """A recorded section counts only while the prompts are frozen, its prompt versions are the frozen ones, and every directory it
+    consulted still hashes the same (a run re-run after gating needs a re-gate) (R55a)."""
+    if not isinstance(sec, dict) or FROZEN_PROMPT_VERSIONS is None or sec.get("prompt_versions") != FROZEN_PROMPT_VERSIONS:
+        return False
+    inputs = sec.get("inputs")
+    return isinstance(inputs, list) and all(isinstance(i, dict) and fingerprint(Path(str(i.get("path")))) == i for i in inputs)
+
+
 def gate_dev(root: Path) -> dict:
+    inputs = [fingerprint(run_dir(root, "dev"))]
     try:
         d, run = accept(root, "dev", frozenset(), DEV_LIMIT)
     except GateRefused as exc:
-        return {"rules": {"R-smoke": _nc(str(exc))}}
+        return {"rules": {"R-smoke": _nc(str(exc))}, "inputs": inputs}
     return {"rules": {"R-smoke": {"pass": r_smoke(run), "computable": True, "run": d.name, "failures": run.get("failures"),
                                   "pages_read": run.get("pages_read"), "pages_readable": run.get("pages_readable")}},
-            "prompt_versions": run.get("prompt_versions")}
+            "prompt_versions": run.get("prompt_versions"), "inputs": inputs}
 
 
 def gate_holdout(root: Path, cases_expected: int | None, gold: Callable[[], dict], s0: Callable[[], dict]) -> dict:
@@ -358,9 +399,11 @@ def gate_holdout(root: Path, cases_expected: int | None, gold: Callable[[], dict
             else:
                 b, s = wrong_counts(preds, g, EXPOSED_HOLDOUT_ROWS), wrong_counts(s0_preds, g, EXPOSED_HOLDOUT_ROWS)
                 rules["R-hold"] = {"pass": r_hold(b, s), "computable": True, "run": d.name, "b": list(b), "s0": list(s),
+                                   "s0_model": BASELINE_MODEL,
                                    "rows": sum(1 for i in g if i not in EXPOSED_HOLDOUT_ROWS)}
     pv = next((r[1].get("prompt_versions") for r in runs.values()), None)
-    return {"rules": rules, "router": "off" if router else "on", "config": sorted(config), "prompt_versions": pv}
+    inputs = [fingerprint(run_dir(root, "holdout", ab)) for ab in sorted({*runs, *why}, key=sorted)]
+    return {"rules": rules, "router": "off" if router else "on", "config": sorted(config), "prompt_versions": pv, "inputs": inputs}
 
 
 def _passed(section: dict | None, rule: str) -> bool:
@@ -375,7 +418,8 @@ def holdout_configuration(holdout: dict | None) -> frozenset[str]:
 def gate_test(root: Path, cases_expected: int | None, sub2: Path, replay: Path | None, holdout: dict | None) -> dict:
     config = holdout_configuration(holdout)
     sec: dict = {"config": sorted(config), "router": "off" if "router" in config else "on", "rules": {},
-                 "replay": {"checked": replay is not None, "identical": None}}
+                 "replay": {"checked": replay is not None, "identical": None},
+                 "inputs": [fingerprint(run_dir(root, "test", config)), *([fingerprint(Path(replay))] if replay is not None else [])]}
     try:
         d, run = accept(root, "test", config, cases_expected)
     except GateRefused as exc:
@@ -408,11 +452,11 @@ def gate_test(root: Path, cases_expected: int | None, sub2: Path, replay: Path |
     return sec
 
 
-def summarize(data: dict) -> tuple[dict[str, bool], dict]:
-    """The rule table and the candidate from the merged gates.json (every call recomputes it; a missing entry counts as failed).
-    "R-route (holdout)" decides the router; "R-route" is the candidate's gate: the test half with the router on, true by
-    construction with it off."""
-    dev, hold, test = data.get("dev"), data.get("holdout"), data.get("test")
+def summarize(data: dict) -> tuple[dict[str, bool], dict, dict[str, bool]]:
+    """The rule table, the candidate and the freshness of each section, from the merged gates.json (every call recomputes them; a
+    missing or stale section counts as failed, R45/R55a). "R-route (holdout)" decides the router; "R-route" is the candidate's gate:
+    the test half with the router on, true by construction with it off."""
+    dev, hold, test = (data.get(k) if section_fresh(data.get(k)) else None for k in ("dev", "holdout", "test"))
     router_off = not _passed(hold, "R-route")
     want = sorted(holdout_configuration(hold))
     fresh = bool(test) and test.get("config") == want      # a test entry made under another configuration is stale
@@ -423,7 +467,8 @@ def summarize(data: dict) -> tuple[dict[str, bool], dict]:
     name, ab = candidate(rules, router_off=router_off)
     replay = (test.get("replay") or {}).get("identical") if fresh else None
     return rules, {"name": name, "ablate": sorted(ab), "router": "off" if router_off else "on", "test_entry_fresh": fresh,
-                   "replay_identical": replay, "submittable": name == "B" and replay is True}
+                   "replay_identical": replay, "submittable": name == "B" and replay is True}, \
+        {"dev": dev is not None, "holdout": hold is not None, "test": fresh}
 
 
 def _line(name: str, r: dict) -> str:
@@ -437,13 +482,17 @@ def _line(name: str, r: dict) -> str:
 def gate(target: str, *, runs_root: Path, gates_json: Path, cases_expected: int | None = None, gold: Callable[[], dict] | None = None,
          s0: Callable[[], dict] | None = None, sub2: Path = SUBMISSION_2, replay: Path | None = None, say=print) -> dict:
     """Compute `target`'s rules, merge them into `gates_json`, print counts only and return the merged dict."""
+    if target not in TARGETS:
+        raise GateRefused(f"unknown target {target}")
     gates_json = Path(gates_json)
     data: dict = {}
-    if gates_json.is_file():
+    if gates_json.exists():                                 # never replaced silently: an unreadable record is refused
         try:
             data = json.loads(gates_json.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
+        except (OSError, ValueError) as exc:
+            raise GateRefused(f"{gates_json.name} unreadable ({type(exc).__name__}); fix or move it by hand") from None
+        if not isinstance(data, dict) or not isinstance(data.get("history", []), list):
+            raise GateRefused(f"{gates_json.name} is not a gates record (an object with a history list)")
     if target == "dev":
         sec = gate_dev(runs_root)
     elif target == "holdout":
@@ -451,10 +500,15 @@ def gate(target: str, *, runs_root: Path, gates_json: Path, cases_expected: int 
             raise GateRefused("no gold or s0 source")
         sec = gate_holdout(runs_root, cases_expected, gold or no_input, s0 or no_input)
     else:
-        sec = gate_test(runs_root, cases_expected, Path(sub2), replay, data.get("holdout"))
+        hold = data.get("holdout")
+        sec = gate_test(runs_root, cases_expected, Path(sub2), replay, hold if section_fresh(hold) else None)
     data[target] = sec
-    rules, cand = summarize(data)
-    data["rules"], data["candidate"] = rules, cand
+    rules, cand, fresh = summarize(data)
+    data["rules"], data["candidate"], data["fresh"] = rules, cand, fresh
+    data["history"] = [*data.get("history", []), {          # append-only, counts only: a re-gate stays visible
+        "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "target": target, "config": sec.get("config"),
+        "rules": {k: {"pass": bool(r.get("pass")), "computable": bool(r.get("computable"))} for k, r in sec["rules"].items()},
+        "inputs": [i["dir"] for i in sec.get("inputs", [])], "candidate": cand["name"]}]
     gates_json.parent.mkdir(parents=True, exist_ok=True)
     tmp = gates_json.with_name(gates_json.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -494,18 +548,22 @@ def load_gold(data_dir: Path) -> dict[str, str]:
         raise GateRefused(f"train labels unreadable ({type(exc).__name__})") from None
 
 
-def s0_holdout_preds(data_dir: Path) -> dict[str, str]:
-    """s0 on the holdout: the cached baseline extraction (prompt 9566ad4b6b95, unsalted, never a model call) through
-    `run_kaggle.assemble_case`. The extractor model name is part of the cache key and run.json does not carry it, so it is taken as
-    `runner.build_agents` does (the configured extractor model; the mock provider is refused)."""
+def s0_holdout_preds(data_dir: Path, *, llm=None, system: str | None = None) -> dict[str, str]:
+    """s0 on the holdout: the cached baseline extraction (model `BASELINE_MODEL`, prompt 9566ad4b6b95, unsalted, never a model call)
+    through `run_kaggle.assemble_case`. The model name is part of the cache key and run.json does not carry it: the configured
+    extractor (or `llm`, tests) must be `BASELINE_MODEL`, and the mock provider is refused. `system` replaces the baseline prompt
+    text (tests only)."""
     from assessor.llm import LLM
     from assessor.tracing import Budget
     from eval import run_kaggle as rk
 
     from . import baseline as baseline_mod
-    llm = LLM.extractor(budget=Budget(max_usd=1.0, max_seconds=0, max_tokens=0, max_tool_calls=0))
+    if llm is None:
+        llm = LLM.extractor(budget=Budget(max_usd=1.0, max_seconds=0, max_tokens=0, max_tool_calls=0))
     if llm.mock_mode:
         raise GateRefused("s0 baseline: the extractor is on the mock provider (the cache is keyed by model)")
+    if llm.model != BASELINE_MODEL:
+        raise GateRefused(f"s0 baseline: the configured extractor model is not the pinned {BASELINE_MODEL}")
     data_dir = Path(data_dir)
     cache = data_dir / "cache" / "extract"
     if not cache.is_dir():
@@ -514,7 +572,7 @@ def s0_holdout_preds(data_dir: Path) -> dict[str, str]:
         cases, pages = rk.load_cases(data_dir), rk.load_pages(data_dir)
         reqs = json.loads((data_dir / "requirements.json").read_text(encoding="utf-8"))
         rl = rk.load_module("kaggle_rules_lite", data_dir / "rules_lite.py")
-        ex = rk.Extractor(baseline_mod._NoCallLLM(llm.model), cache, True, system=baseline_mod.baseline_prompt())
+        ex = rk.Extractor(baseline_mod._NoCallLLM(llm.model), cache, True, system=system or baseline_mod.baseline_prompt())
         preds: dict[str, str] = {}
         bad = 0
         for cid in rk.select_cases(cases, "train", "holdout", None, None):
@@ -556,5 +614,9 @@ def main(argv: list[str] | None = None) -> int:
     elif a.target == "test":
         kw.update(cases_expected=subset_size(data, "test", "all"), sub2=Path(a.sub2),
                   replay=Path(a.replay) if a.replay else None)
-    gate(a.target, **kw)
+    try:
+        gate(a.target, **kw)
+    except GateRefused as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
     return 0

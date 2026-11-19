@@ -26,6 +26,7 @@ RT = frozenset({"router"})
 RTDM = RT | DM
 PV = {"planner": "aaaaaaaaaaaa", "router": "bbbbbbbbbbbb", "decision_maker": "cccccccccccc"}
 CANARY = "ZZCANARYREQ"                      # an invented requirement id: must never reach stdout or gates.json
+FRESH = {"prompt_versions": PV, "inputs": []}       # a hand-written section that summarize() accepts as fresh (R55a)
 LABEL_WORDS = ("PASS", "FAIL", "UNKNOWN", "NEEDS_REVIEW", "BLOCKED", "CONDITIONAL", "READY_FOR_APPROVAL")
 
 
@@ -469,14 +470,15 @@ TEST_SUB = {f"t{i}__R": "PASS" for i in range(40)}
 def test_gate_reads_the_run_in_the_r_dm_configuration(tmp_path, frozen):
     gj = tmp_path / "gates.json"
     route = {"R-route": {"pass": True, "computable": True}}
-    gj.write_text(json.dumps({"holdout": {"rules": {**route, "R-DM": {"pass": True, "computable": True}}, "config": []}}))
+    gj.write_text(json.dumps({"holdout": {"rules": {**route, "R-DM": {"pass": True, "computable": True}}, "config": [], **FRESH}}))
     write_run(tmp_path, "test", (), run=rj("test", n=40), submission=TEST_SUB)
     write_run(tmp_path, "test", DM, run=rj("test", DM, n=40), submission={k: "FAIL" for k in TEST_SUB})
     sub2 = write_csv(tmp_path / "sub2.csv", TEST_SUB)
     out = gates.gate("test", runs_root=tmp_path, gates_json=gj, cases_expected=40, sub2=sub2, say=lambda *_: None)
     r = out["test"]["rules"]["R-test"]
     assert r["pass"] and r["changed"] == 0 and r["run"] == "test_all"
-    gj.write_text(json.dumps({"holdout": {"rules": {**route, "R-DM": {"pass": False, "computable": True}}, "config": ["decision_maker"]}}))
+    gj.write_text(json.dumps({"holdout": {"rules": {**route, "R-DM": {"pass": False, "computable": True}}, "config": ["decision_maker"],
+                                          **FRESH}}))
     out = gates.gate("test", runs_root=tmp_path, gates_json=gj, cases_expected=40, sub2=sub2, say=lambda *_: None)
     r = out["test"]["rules"]["R-test"]
     assert not r["pass"] and r["changed"] == 40 and r["run"] == "test_all_ablate-decision_maker"
@@ -510,9 +512,9 @@ def test_a_missing_submission_2_is_not_computable(tmp_path, frozen):
 def _full_green(tmp_path, gj: Path, *, dm_pass=True, test_recall=None, router_on=True):
     ab = (frozenset() if router_on else RT) | (frozenset() if dm_pass else DM)
     gj.write_text(json.dumps({
-        "dev": {"rules": {"R-smoke": {"pass": True, "computable": True}}},
+        "dev": {"rules": {"R-smoke": {"pass": True, "computable": True}}, **FRESH},
         "holdout": {"rules": {"R-DM": {"pass": dm_pass, "computable": True}, "R-hold": {"pass": True, "computable": True},
-                              "R-route": {"pass": router_on, "computable": True}}, "config": sorted(ab)}}))
+                              "R-route": {"pass": router_on, "computable": True}}, "config": sorted(ab), **FRESH}}))
     over = {} if test_recall is None else {"route_recall": test_recall}
     d = write_run(tmp_path, "test", ab, run=rj("test", ab, n=40, **over), preds={"t0__R": "PASS"}, submission=TEST_SUB)
     return d, write_csv(tmp_path / "sub2.csv", TEST_SUB)
@@ -653,3 +655,182 @@ def test_main_module_routes_gates(monkeypatch):
 def test_s0_baseline_refuses_on_the_mock_provider(tmp_path):
     with pytest.raises(GateRefused):
         gates.s0_holdout_preds(tmp_path)
+
+
+# ---------------------------------------------------------------- fix round 1: fresh inputs (R55a), pinned s0 model (R55b), history
+def test_a_dev_entry_on_other_prompt_versions_is_not_fresh(tmp_path, frozen):
+    gj = tmp_path / "gates.json"
+    write_run(tmp_path, "dev", run=rj("dev", prompt_versions={**PV, "router": "ffffffffffff"}))
+    out = gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+    assert out["dev"]["rules"]["R-smoke"]["pass"]                    # the smoke itself passed ...
+    assert out["fresh"]["dev"] is False and out["rules"]["R-smoke"] is False      # ... but not on the frozen prompts
+    write_run(tmp_path, "dev")
+    out = gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+    assert out["fresh"]["dev"] is True and out["rules"]["R-smoke"] is True
+
+
+def test_with_frozen_none_no_section_is_fresh(tmp_path, monkeypatch):
+    gj = tmp_path / "gates.json"
+    monkeypatch.setattr(gates, "FROZEN_PROMPT_VERSIONS", dict(PV))
+    _, sub2 = _full_green(tmp_path, gj)
+    assert gates.gate("test", runs_root=tmp_path, gates_json=gj, cases_expected=40, sub2=sub2,
+                      say=lambda *_: None)["candidate"]["name"] == "B"
+    monkeypatch.setattr(gates, "FROZEN_PROMPT_VERSIONS", None)
+    out = gates.gate("dev", runs_root=tmp_path / "nodev", gates_json=gj, say=lambda *_: None)
+    assert out["fresh"] == {"dev": False, "holdout": False, "test": False} and out["candidate"]["name"] == "none"
+
+
+def test_sections_record_input_hashes(tmp_path, frozen):
+    import hashlib
+    write_run(tmp_path, "holdout", (), preds=preds_with(1))
+    d = write_run(tmp_path, "holdout", DM, preds=preds_with(3))
+    sec = holdout(tmp_path)["holdout"]
+    rec = {i["dir"]: i for i in sec["inputs"]}
+    assert set(rec) == {"train_holdout", "train_holdout_ablate-decision_maker"}
+    assert rec[d.name]["run.json"] == hashlib.sha256((d / "run.json").read_bytes()).hexdigest()
+    assert rec[d.name]["preds.csv"] == hashlib.sha256((d / "preds.csv").read_bytes()).hexdigest()
+
+
+def test_a_holdout_dir_rewritten_after_gating_is_not_fresh(tmp_path, frozen):
+    gj = tmp_path / "gates.json"
+    write_run(tmp_path, "holdout", (), preds=preds_with(1))
+    d = write_run(tmp_path, "holdout", DM, preds=preds_with(3))
+    out = holdout(tmp_path, gates_json=gj)
+    assert out["fresh"]["holdout"] is True and out["rules"]["R-hold"] is True
+    write_csv(d / "preds.csv", preds_with(2))                          # re-run after gating: a re-gate is needed
+    out = gates.gate("dev", runs_root=tmp_path / "nodev", gates_json=gj, say=lambda *_: None)
+    assert out["fresh"]["holdout"] is False and out["rules"]["R-hold"] is False and out["rules"]["R-DM"] is False
+
+
+def test_a_refused_input_that_appears_later_makes_the_section_stale(tmp_path, frozen):
+    gj = tmp_path / "gates.json"
+    write_run(tmp_path, "holdout", (), preds=preds_with(1))
+    holdout(tmp_path, gates_json=gj)                                  # the DM-ablated run was missing
+    write_run(tmp_path, "holdout", DM, preds=preds_with(3))
+    out = gates.gate("dev", runs_root=tmp_path / "nodev", gates_json=gj, say=lambda *_: None)
+    assert out["fresh"]["holdout"] is False
+
+
+def test_a_test_dir_rewritten_after_gating_is_not_fresh(tmp_path, frozen):
+    gj = tmp_path / "gates.json"
+    cand, sub2 = _full_green(tmp_path, gj)
+    gates.gate("test", runs_root=tmp_path, gates_json=gj, cases_expected=40, sub2=sub2, say=lambda *_: None)
+    write_csv(cand / "submission.csv", {k: "FAIL" for k in TEST_SUB})
+    out = gates.gate("dev", runs_root=tmp_path / "nodev", gates_json=gj, say=lambda *_: None)
+    assert out["fresh"]["test"] is False and out["candidate"]["name"] == "none"
+
+
+def test_the_test_gate_ignores_a_stale_holdout_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(gates, "FROZEN_PROMPT_VERSIONS", dict(PV))
+    gj = tmp_path / "gates.json"
+    _full_green(tmp_path, gj)
+    data = json.loads(gj.read_text())
+    data["holdout"]["prompt_versions"] = {**PV, "router": "ffffffffffff"}
+    gj.write_text(json.dumps(data))
+    out = gates.gate("test", runs_root=tmp_path, gates_json=gj, cases_expected=40, sub2=tmp_path / "x.csv", say=lambda *_: None)
+    assert out["test"]["config"] == ["decision_maker", "router"]
+
+
+def test_r_hold_records_the_pinned_s0_model(tmp_path, frozen):
+    write_run(tmp_path, "holdout", (), preds=preds_with(1))
+    write_run(tmp_path, "holdout", DM, preds=preds_with(3))
+    r = holdout(tmp_path)["holdout"]["rules"]["R-hold"]
+    assert r["s0_model"] == gates.BASELINE_MODEL == "MiniMax-M3.1-Flash"
+
+
+def test_an_unreadable_gates_json_is_refused_and_left_alone(tmp_path, capsys):
+    gj = tmp_path / "gates.json"
+    gj.write_text("{not json")
+    write_run(tmp_path, "dev")
+    with pytest.raises(GateRefused, match="JSONDecodeError"):
+        gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+    assert gj.read_text() == "{not json"
+    assert gates.main(["--target", "dev", "--runs-root", str(tmp_path), "--gates-json", str(gj)]) != 0
+    assert "refused" in capsys.readouterr().out and gj.read_text() == "{not json"
+
+
+def test_an_unknown_target_is_refused(tmp_path):
+    with pytest.raises(GateRefused):
+        gates.gate("nope", runs_root=tmp_path, gates_json=tmp_path / "g.json", say=lambda *_: None)
+    assert not (tmp_path / "g.json").exists()
+
+
+def test_every_gate_run_appends_one_history_record(tmp_path, frozen):
+    gj = tmp_path / "gates.json"
+    write_run(tmp_path, "dev")
+    gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+    first = json.loads(gj.read_text())["history"]
+    write_run(tmp_path, "dev", run=rj("dev", failures=2))
+    gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+    hist = json.loads(gj.read_text())["history"]
+    assert len(first) == 1 and len(hist) == 2 and hist[0] == first[0]
+    assert hist[0]["target"] == "dev" and hist[0]["rules"]["R-smoke"] == {"pass": True, "computable": True}
+    assert hist[1]["rules"]["R-smoke"] == {"pass": False, "computable": True}
+    assert hist[1]["inputs"] == ["train_dev_limit-20"] and hist[1]["utc"].endswith("Z")
+
+
+def test_history_that_is_not_a_list_is_refused(tmp_path):
+    gj = tmp_path / "gates.json"
+    gj.write_text(json.dumps({"history": {"x": 1}}))
+    with pytest.raises(GateRefused):
+        gates.gate("dev", runs_root=tmp_path, gates_json=gj, say=lambda *_: None)
+
+
+class _StubExtractorLLM:
+    mock_mode = False
+
+    def __init__(self, model):
+        self.model = model
+
+
+TINY_SYSTEM = "Invented extraction prompt for the gates test."
+TINY_RL = """
+def evaluate(facts, requirements, tier, users, as_of):
+    return {}
+
+
+def overall(verdicts, requirements):
+    return "CONDITIONAL"
+"""
+
+
+def tiny_data(tmp_path: Path, *, cache_all=True) -> Path:
+    from eval import kaggle_policy as kp
+    from tests.test_vv_runner import write_data
+    d = write_data(tmp_path / "data", split="train")                 # 3 invented train cases; holdout = the odd position, c0002
+    (d / "requirements.json").write_text("[]", encoding="utf-8")
+    (d / "rules_lite.py").write_text(TINY_RL, encoding="utf-8")
+    with (d / "train_labels.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "verdict"])
+        w.writerows([["c0001__OVERALL", "CONDITIONAL"], ["c0002__OVERALL", "BLOCKED"], ["c0002__R-x", "PASS"]])
+    cache = d / "cache" / "extract"
+    cache.mkdir(parents=True)
+    pages = [json.loads(line) for line in (d / "pages.jsonl").read_text(encoding="utf-8").splitlines()]
+    for i, pg in enumerate(p for p in pages if p["case_id"] == "c0002"):
+        if cache_all or i:
+            key = kp.cache_key(gates.BASELINE_MODEL, pg, "", system=TINY_SYSTEM)
+            (cache / f"{key}.json").write_text(json.dumps({"claims": [], "in": 1, "out": 1}), encoding="utf-8")
+    return d
+
+
+def test_real_input_loaders_on_an_invented_data_dir(tmp_path):
+    d = tiny_data(tmp_path)
+    assert gates.subset_size(d, "train", "holdout") == 1 and gates.subset_size(d, "train", "dev") == 2
+    assert gates.subset_size(tmp_path / "absent", "train", "holdout") is None
+    gold = gates.load_gold(d)
+    assert set(gold) == {"c0002__OVERALL", "c0002__R-x"}             # holdout cases only
+    preds = gates.s0_holdout_preds(d, llm=_StubExtractorLLM(gates.BASELINE_MODEL), system=TINY_SYSTEM)
+    assert set(preds) == {"c0002__OVERALL"}
+
+
+def test_s0_refuses_another_extractor_model(tmp_path):
+    d = tiny_data(tmp_path)
+    with pytest.raises(GateRefused, match="MiniMax-M3.1-Flash"):
+        gates.s0_holdout_preds(d, llm=_StubExtractorLLM("Some-Other-Model"), system=TINY_SYSTEM)
+
+
+def test_s0_refuses_a_page_missing_from_the_cache(tmp_path):
+    d = tiny_data(tmp_path, cache_all=False)
+    with pytest.raises(GateRefused, match="1 holdout cases"):
+        gates.s0_holdout_preds(d, llm=_StubExtractorLLM(gates.BASELINE_MODEL), system=TINY_SYSTEM)
