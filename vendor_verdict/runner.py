@@ -2,7 +2,9 @@
 
     python -m vendor_verdict run --split test|train --subset all|dev|holdout [--limit N] [--only ids] [--cache-only] [--estimate]
         [--salt S] [--engine plain|langgraph] [--ablate router,grader,decision_maker,iteration2] [--workers 6] [--out DIR]
-        [--data DIR] [--max-usd X] [--wait-quota] [--quota-poll-minutes 10] [--quota-max-hours 6]
+        [--data DIR] [--max-usd X] [--wait-quota] [--quota-poll-minutes 10] [--quota-max-hours 6] [--allow-local-down]
+    python -m vendor_verdict run ... --prewarm-local    # the Router only, on the local server: fills its cache, no hosted call
+    python -m vendor_verdict selfcheck [--limit 3]      # dev cases through the real rules_lite, replay readers (vendor_verdict.selfcheck)
 
 Outputs in `--out` (default `reports/vendor_verdict/<split>_<subset>[_ablate-a+b][_salt-S]/`):
 - `preds.csv` (id, verdict) for every finished case, in case-id order (never completion order), so a cache-only rerun is byte-identical;
@@ -27,8 +29,12 @@ the agents' retry ladder raises `QuotaExhausted`. By default the run then stops 
 written, the rest are pending, no submission). With `--wait-quota` the workers wait at a shared gate and one probe case per poll
 interval tests the window, up to `--quota-max-hours`. A resume is the same command again: every successful call is cached.
 
+Local server (vendor_verdict.local): every local call takes one of `config.LOCAL_SLOTS` permits shared by all workers; a run that can
+pay and uses a local role checks `<server>/health` first and refuses to start when it is down, unless --allow-local-down.
+
 Exit status: 0 complete; 1 complete but the submission self-check found problems; 3 any other partial run (budget, failed pages,
-case errors, cache-only misses, unfinished cases); 75 (EX_TEMPFAIL) a quota stop; 130 interrupted. To retry only quota stops:
+case errors, cache-only misses, unfinished cases); 69 (EX_UNAVAILABLE) the local server is down, nothing started (not retried by the
+loop below); 75 (EX_TEMPFAIL) a quota stop; 130 interrupted. To retry only quota stops:
     while :; do python -m vendor_verdict run ...; rc=$?; [ $rc -eq 75 ] || break; sleep 600; done
 (`until ...; do sleep 600; done` would also loop on a deterministic partial run, exit 3, forever.)
 
@@ -54,20 +60,20 @@ from dataclasses import replace
 from pathlib import Path
 
 from assessor.llm import LLMError
-from assessor.tracing import BudgetExceeded, estimate_tokens
+from assessor.tracing import BudgetExceeded
 from eval import run_kaggle as rk
 
 from . import baseline as baseline_mod
 from . import data as data_mod
-from .agents import planner as planner_agent
+from . import local as local_mod
 from .agents import reviewer
-from .agents import specialists as specialist_agents
 from .cache import CallCache
-from .config import FAMILIES, GRADER_FIELDS, LOCAL_SCOPE, ROOT
+from .cli import estimate, format_estimate      # the --estimate report (moved, R40)
+from .config import FAMILIES, LOCAL_SCOPE, ROOT
 from .graph import build_langgraph, mermaid, new_state, run_plain
 from .nodes import ABLATIONS, FAILED_PAGE_NOTE, FLAG_KEYS, Agents, _readable_pages
 from .quota import QuotaExhausted, QuotaGate
-from .prompts import DECISION_SYSTEM, GRADER_SYSTEM, PLANNER_SYSTEM, ROUTER_SYSTEM, SPECIALIST_SYSTEM, page_user_prompt, version
+from .prompts import DECISION_SYSTEM, GRADER_SYSTEM, PLANNER_SYSTEM, ROUTER_SYSTEM, SPECIALIST_SYSTEM, version
 from .safe import safe_id
 from .trace import Trace
 
@@ -84,6 +90,7 @@ _OUTPUTS = ("submission.csv", "run.json", "preds.csv", "graph.mmd")
 # up (the gate restarts the case otherwise).
 STOP_EXCEPTIONS: tuple[type[BaseException], ...] = (BudgetExceeded, QuotaExhausted)
 EXIT_OK, EXIT_SUBMISSION_PROBLEMS, EXIT_PARTIAL, EXIT_QUOTA, EXIT_INTERRUPTED = 0, 1, 3, 75, 130
+EXIT_LOCAL_DOWN = local_mod.EXIT_LOCAL_DOWN      # 69
 
 
 def _stop_name(exc: BaseException) -> str:
@@ -343,123 +350,6 @@ def load_split(data_dir: Path, split: str, subset: str, limit: int | None = None
     return data_mod.load(Path(data_dir), split, subset, limit, only)
 
 
-# ------------------------------------------------------------------------------------------------ estimate
-def _exists(root: Path, key: str) -> bool:
-    return (root / f"{key}.json").exists()           # looks only: never cache.get (it would count) and never a write
-
-
-def _tokens(tin: int) -> dict:
-    return {"tokens_in": tin, "tokens_out": round(tin * rk.OUT_PER_IN)}
-
-
-def estimate(cases: dict, pages: dict, ids: list[str], ag: Agents) -> dict:
-    """Calls and tokens per role before the run, with no model call and no file write. Tokens are for the UNCACHED calls only
-    (`run_kaggle.estimate_call_tokens` / `OUT_PER_IN`). Planner, router and per-page specialist calls are measured against the cache
-    files on disk; the specialist "expected" figure assumes the baseline claims' families per page (needs a baseline cache); "worst"
-    sends every readable page to all 4 families and the iteration-2 worst case re-reads every family of every case (upper bounds).
-    Grader and decision maker calls depend on what is read, so they cannot be cache-checked before the run."""
-    root = Path(ag.cache.root)
-    main_m, reader_m, local_m = ag.main_llm.model, ag.reader_llm.model, ag.local_llm.model
-    have_base = ag.baseline_dir is not None and Path(ag.baseline_dir).is_dir()
-    plan = {"calls": 0, "uncached": 0, "tokens_in": 0}
-    route = {"pages": 0, "calls": 0, "uncached": 0, "tokens_in": 0}
-    worst = {"per_page": len(FAMILIES), "calls": 0, "uncached": 0, "tokens_in": 0}
-    expected = {"calls": 0, "uncached": 0, "tokens_in": 0}
-    it2 = {"calls": 0, "tokens_in": 0}
-    readable_n = grader_n = 0
-    for cid in ids:
-        recs = rk.triage(cases[cid], pages[cid])
-        readable = [r["page"] for r in recs if rk.readable(r)]
-        uniq = _readable_pages({"recs": recs})
-        readable_n += len(uniq)
-        if readable:
-            user = planner_agent.metadata_prompt(readable)
-            plan["calls"] += 1
-            if not _exists(root, ag.cache.key("planner", version(PLANNER_SYSTEM), main_m, planner_agent.payload(user, cid), ag.salt)):
-                plan["uncached"] += 1
-                plan["tokens_in"] += estimate_tokens(PLANNER_SYSTEM + user)
-        if "router" not in ag.ablate and "router" in LOCAL_SCOPE:
-            route["pages"] += len(readable)
-            for p in readable:
-                route["calls"] += 1
-                if not _exists(root, ag.cache.key("router", version(ROUTER_SYSTEM), local_m, page_user_prompt(p))):
-                    route["uncached"] += 1
-                    route["tokens_in"] += rk.estimate_call_tokens([p], ROUTER_SYSTEM)[0]
-        base_fams: dict[str, set[str]] = {}
-        if have_base:
-            base = baseline_mod.baseline_readings(ag.baseline_model, recs, Path(ag.baseline_dir))
-            for pid, fields in baseline_mod.route_baseline_fields(base, recs).items():
-                base_fams[pid] = {f for f in FAMILIES if set(FAMILIES[f]) & fields}
-            grader_n += sum(1 for pid in uniq for r in base.get(pid, []) if r.get("field") in GRADER_FIELDS)
-        for f in FAMILIES:
-            system = SPECIALIST_SYSTEM[f]
-            for pid, page in uniq.items():
-                key = ag.cache.key(f"specialist:{f}", version(system), reader_m,
-                                   specialist_agents.payload(page_user_prompt(page), f), ag.salt)
-                cached = _exists(root, key)
-                tin = 0 if cached else rk.estimate_call_tokens([page], system)[0]
-                worst["calls"] += 1
-                worst["uncached"] += int(not cached)
-                worst["tokens_in"] += tin
-                if f in base_fams.get(pid, ()):
-                    expected["calls"] += 1
-                    expected["uncached"] += int(not cached)
-                    expected["tokens_in"] += tin
-            if uniq and "iteration2" not in ag.ablate:
-                it2["calls"] += 1
-                it2["tokens_in"] += estimate_tokens(system + specialist_agents.case_user_prompt(list(uniq.values()), list(FAMILIES[f])))
-    per_page = lambda n: n / readable_n if readable_n else 0.0      # noqa: E731
-    exp = None
-    if have_base:
-        exp = {"per_page": per_page(expected["calls"]), "calls": expected["calls"], "uncached": expected["uncached"],
-               **_tokens(expected["tokens_in"]), "basis": "the baseline claims' families per page; uncached measured"}
-    return {
-        "cases": len(ids), "pages_readable": readable_n,
-        "planner": {"calls": plan["calls"], "uncached": plan["uncached"], **_tokens(plan["tokens_in"]), "basis": "measured"},
-        "router": {"pages": route["pages"], "calls": route["calls"], "uncached": route["uncached"], **_tokens(route["tokens_in"]),
-                   "basis": "ablated" if "router" in ag.ablate else "measured"},
-        "specialist": {"expected": exp, "expected_note": None if have_base else "no baseline cache: expected per page unknown",
-                       "worst": {"per_page": worst["per_page"], "calls": worst["calls"], "uncached": worst["uncached"],
-                                 **_tokens(worst["tokens_in"]), "basis": "upper bound: every readable page to all 4; uncached measured"}},
-        "iteration2_worst": {"calls": it2["calls"], **_tokens(it2["tokens_in"]),
-                             "basis": "ablated" if "iteration2" in ag.ablate else "upper bound: every family of every case"},
-        "grader": {"readings_expected": grader_n if have_base else None,
-                   "basis": "the baseline claims' count; not cache-checkable before the run" if have_base else "no baseline cache"},
-        "decision_maker": {"basis": "not estimable before the run (conflicts are known only after reading)"},
-    }
-
-
-def format_estimate(est: dict) -> list[str]:
-    def tok(d):
-        return f"tokens in {d['tokens_in']:,} / out {d['tokens_out']:,}"
-    s = est["specialist"]
-    lines = ["estimate (no model call made; tokens are for uncached calls; 'measured' = counted from the cache files on disk, "
-             "'upper bound' = a worst case, 'expected' = from the baseline claims):",
-             f"  cases {est['cases']}, readable pages {est['pages_readable']}",
-             f"  planner [paid, main]: calls {est['planner']['calls']}, uncached {est['planner']['uncached']} (measured); {tok(est['planner'])}",
-             f"  router [local]: pages {est['router']['pages']}, uncached {est['router']['uncached']} ({est['router']['basis']}); "
-             f"{tok(est['router'])}"]
-    if s["expected"] is not None:
-        e = s["expected"]
-        lines.append(f"  specialists [paid, reader] expected: {e['per_page']:.2f} per page = {e['calls']} calls, uncached {e['uncached']} "
-                     f"(from the baseline claims' families; uncached measured); {tok(e)}")
-    else:
-        lines.append(f"  specialists [paid, reader] expected: unknown ({s['expected_note']})")
-    w = s["worst"]
-    lines.append(f"  specialists [paid, reader] worst case: {w['per_page']} per page = {w['calls']} calls, uncached {w['uncached']} "
-                 f"(upper bound; uncached measured); {tok(w)}")
-    i2 = est["iteration2_worst"]
-    lines.append(f"  iteration 2 [paid, reader] worst case: {i2['calls']} case reads ({i2['basis']}); {tok(i2)}")
-    g = est["grader"]
-    lines.append(f"  grader [local]: readings expected {g['readings_expected'] if g['readings_expected'] is not None else 'unknown'} "
-                 f"({g['basis']})")
-    lines.append(f"  decision maker [local]: {est['decision_maker']['basis']}")
-    lines.append("  quota window [paid]: its size is unknown to the runner; the user reports that earlier passes used under half of "
-                 "a 5-hour window (their statement, unmeasured); a quota stop is resumable (the same command again; finished calls "
-                 "are cached)")
-    return lines
-
-
 # ------------------------------------------------------------------------------------------------ one case
 def _run_case(case: dict, pages: list[dict], ag: Agents, app) -> dict:
     state = new_state(case, pages)
@@ -481,12 +371,13 @@ def _run_case(case: dict, pages: list[dict], ag: Agents, app) -> dict:
 def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | None = None, only: list[str] | None = None,
         cache_only: bool = False, engine: str = "plain", workers: int = 6, metric=None, budget=None, say=print,
         wait_quota: bool = False, quota_poll_minutes: float = 10.0, quota_max_hours: float = 6.0, quota_clock=None,
-        quota_sleep=None) -> dict:
+        quota_sleep=None, local_health: str = "not_checked") -> dict:
     """Run the selected cases and write the outputs into `out`; returns the run.json dict. `agents` holds the models (the seam tests
     stub), the cache, rules_lite, the requirements, the baseline, the salt and the ablations. `metric` is the host's metric module
     (loaded from the data dir when a submission is written and none is given); `budget` (optional) is reported in `spend`.
     `wait_quota`, `quota_poll_minutes`, `quota_max_hours`: the QuotaGate's mode (vendor_verdict.quota); `quota_clock` and
-    `quota_sleep` replace its clock and its sleep (tests; the default sleep waits on the run's stop event, so Ctrl-C ends it)."""
+    `quota_sleep` replace its clock and its sleep (tests; the default sleep waits on the run's stop event, so Ctrl-C ends it).
+    `local_health`: the CLI's health-check verdict for run.json `local.health` (vendor_verdict.local.HEALTH_VALUES)."""
     if engine not in ("plain", "langgraph"):
         raise ValueError(f"unknown engine {engine!r}")
     t_start = time.perf_counter()
@@ -507,8 +398,10 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
     gate = QuotaGate(wait=wait_quota, poll_seconds=float(quota_poll_minutes) * 60, max_seconds=float(quota_max_hours) * 3600,
                      stop=stop, clock=quota_clock, sleep=quota_sleep, abort_exc=RunStopped)
     cache = RoleCache(Path(agents.cache.root))
-    llms = {k: GuardedLLM(getattr(agents, k), cache_only, stop, gate if k != "local_llm" else None)    # local roles: no quota
-            for k in ("main_llm", "reader_llm", "local_llm")}
+    lim = local_mod.limited(agents.local_llm)          # the shared local permits; a refused cache-only call takes none
+    lim.reset()
+    llms = {k: GuardedLLM(lim if k == "local_llm" else getattr(agents, k), cache_only, stop, gate if k != "local_llm" else None)
+            for k in ("main_llm", "reader_llm", "local_llm")}                                  # local roles: no quota gate
     ag = replace(agents, cache=cache, **llms)
     app = build_langgraph(ag) if engine == "langgraph" else None
     mode = (["cache-only"] if cache_only else []) + (["salted"] if ag.salt else []) + \
@@ -652,6 +545,7 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
                                               "tokens_out": _int(budget.output_tokens), "llm_calls": _int(budget.llm_calls)},
         "resume_count": resume_count,
         "quota": gate.block(),
+        "local": local_mod.block(lim, local_health),
         "wall_seconds": round(time.perf_counter() - t_start, 3),
     }
     (out / "run.json").write_text(_dump(rj), encoding="utf-8")
@@ -659,6 +553,7 @@ def run(data_dir, split: str, subset: str, *, agents: Agents, out, limit: int | 
     say(f"finished {len(finished)}/{len(ids)} cases (pending {len(unfinished)}, errors {len(errors)}); readable pages {readable}, read {rj['pages_read']}, failed {len(failed_pages)}, "
         f"unrouted {unrouted}; failures {rj['failures']}; iteration-2 cases {rj['iteration2_cases']}")
     say("local fallbacks: " + ", ".join(f"{k} {v}" for k, v in rj["local_fallbacks"].items()))
+    say(local_mod.format_block(rj["local"]))
     q = rj["quota"]
     if q is not None:                                   # status and kind only: the provider's message is in run.json
         say(f"quota: kind {q['kind']}, status {q['status'] if q['status'] is not None else 'none'}; wait mode "
@@ -707,7 +602,7 @@ def build_agents(a, data_dir: Path):
     reqs = json.loads((data_dir / "requirements.json").read_text(encoding="utf-8"))
     rl = rk.load_module("kaggle_rules_lite", data_dir / "rules_lite.py")
     metric = rk.load_module("kaggle_metric", data_dir / "metric.py") if a.split == "test" else None
-    ag = Agents(main_llm=main_llm, reader_llm=reader, local_llm=local, cache=CallCache(data_dir / "cache" / "agents"), rl=rl, reqs=reqs,
+    ag = Agents(main_llm=main_llm, reader_llm=reader, local_llm=local_mod.limited(local), cache=CallCache(data_dir / "cache" / "agents"), rl=rl, reqs=reqs,
                 baseline_dir=data_dir / "cache" / "extract", baseline_model=reader.model, salt=a.salt, ablate=parse_ablate(a.ablate))
     return ag, budget, metric
 
@@ -736,12 +631,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="on an exhausted quota window, wait and probe (one case per poll) instead of stopping (exit 75)")
     r.add_argument("--quota-poll-minutes", type=float, default=10.0, help="minutes between quota probes with --wait-quota")
     r.add_argument("--quota-max-hours", type=float, default=6.0, help="total wait with --wait-quota before stopping as a quota stop")
+    r.add_argument("--allow-local-down", action="store_true",
+                   help="start a paid run even if the local server's health check fails (local fallbacks; not reproducible)")
+    r.add_argument("--prewarm-local", action="store_true",
+                   help="only route every readable page on the local server (fills the Router cache; no hosted call), then exit")
     r.add_argument("--out", default="")
+    from . import selfcheck                             # imported here: selfcheck imports this module
+    selfcheck.add_arguments(sub.add_parser("selfcheck", help="dev cases through the real rules_lite; no model or network call"))
     return ap
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, http_get=None) -> int:
+    """The CLI. `http_get` replaces the health check's HTTP getter (tests)."""
     a = build_parser().parse_args(argv)
+    if a.cmd == "selfcheck":
+        from . import selfcheck
+        return selfcheck.main(a)
 
     data_dir = Path(a.data)
     ablate = parse_ablate(a.ablate)
@@ -752,11 +657,20 @@ def main(argv: list[str] | None = None) -> int:
         cases, pages, ids = load_split(data_dir, a.split, a.subset, a.limit or None, only)
         for line in format_estimate(estimate(cases, pages, sorted(ids), ag)):
             print(line)
+        print("local server health: skipped (--estimate: no model call)")
         return 0
+    if a.prewarm_local and a.cache_only:
+        raise SystemExit("--prewarm-local makes local calls: it cannot be combined with --cache-only")
+    if a.prewarm_local:
+        cases, pages, ids = load_split(data_dir, a.split, a.subset, a.limit or None, only)
+        return local_mod.prewarm_cli(cases, pages, sorted(ids), ag, ablate=ablate, say=print, get=http_get)
+    health = local_mod.start_check(ag.local_llm, cache_only=a.cache_only, ablate=ablate, allow_down=a.allow_local_down, get=http_get)
+    if health is None:
+        return EXIT_LOCAL_DOWN                          # before run(): nothing started, no earlier output removed
     out = Path(a.out) if a.out else default_out(a.split, a.subset, ablate, a.salt)
     rj = run(data_dir, a.split, a.subset, agents=ag, out=out, limit=a.limit or None, only=only, cache_only=a.cache_only,
              engine=a.engine, workers=a.workers, metric=metric, budget=budget, wait_quota=a.wait_quota,
-             quota_poll_minutes=a.quota_poll_minutes, quota_max_hours=a.quota_max_hours)
+             quota_poll_minutes=a.quota_poll_minutes, quota_max_hours=a.quota_max_hours, local_health=health)
     return exit_code(rj)
 
 

@@ -257,7 +257,7 @@ def traces(out: Path) -> dict:
 
 
 # run.json fields that count THIS run's calls or time (a resume makes fewer calls), plus the two the brief names
-RUN_ONLY = {"quota", "resume_count", "wall_seconds", "roles", "cache", "spend"}
+RUN_ONLY = {"quota", "resume_count", "wall_seconds", "roles", "cache", "spend", "local"}
 
 
 def _comparable(rj: dict) -> dict:

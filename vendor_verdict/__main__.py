@@ -1,4 +1,4 @@
-"""`python -m vendor_verdict run ...`: see vendor_verdict.runner."""
+"""`python -m vendor_verdict run ...` and `python -m vendor_verdict selfcheck ...`: see vendor_verdict.runner."""
 import sys
 
 from .runner import main
