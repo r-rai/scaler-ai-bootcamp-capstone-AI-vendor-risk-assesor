@@ -227,10 +227,42 @@ def test_decision_maker_ablation_and_a_clean_run_write_the_submission(tmp_path):
             assert [r["id"] for r in csv.DictReader(f)] == [r["id"] for r in csv.DictReader((tmp_path / name / "data" / "test.csv").open())]
 
 
-@pytest.mark.parametrize("ablate", [{"router"}, {"grader"}, {"iteration2"}, {"decision_maker", "grader"}])
+@pytest.mark.parametrize("ablate", [{"router", "grader"}, {"grader"}, {"iteration2"}, {"decision_maker", "grader"},      # R54: {"router"} alone now writes
+                                    {"decision_maker", "iteration2"}, {"router", "decision_maker", "grader"}])
 def test_any_other_ablation_writes_no_submission(tmp_path, ablate):
     out = run_fixture(tmp_path, ablate=ablate)
     assert not (out / "submission.csv").exists() and run_json(out)["submission"]["written"] is False
+
+
+@pytest.mark.parametrize("ablate", [{"router"}, {"router", "decision_maker"}])
+def test_router_off_candidate_configurations_write_the_submission(tmp_path, ablate):      # ruling R54: gates.candidate() can select them
+    metric = StubMetric()
+    out = run_fixture(tmp_path, ablate=ablate, metric=metric)
+    assert (out / "submission.csv").exists() and metric.calls == 1
+    rj = run_json(out)
+    assert rj["ablate"] == sorted(ablate) and rj["partial"] is False
+    assert rj["submission"] == {"written": True, "reason": "ok", "problems": []}
+    with (out / "submission.csv").open(encoding="utf-8") as f:
+        assert [r["id"] for r in csv.DictReader(f)] == [r["id"] for r in csv.DictReader((tmp_path / "data" / "test.csv").open())]
+
+
+def test_the_allowed_submission_ablations_are_exactly_the_four_candidate_sets():      # R54 (R4 amended)
+    assert len(runner.SUBMISSION_ABLATIONS) == 4
+    assert set(runner.SUBMISSION_ABLATIONS) == {frozenset(), frozenset({"decision_maker"}), frozenset({"router"}),
+                                                frozenset({"router", "decision_maker"})}
+
+
+@pytest.mark.parametrize("ablate,ok", [
+    (frozenset(), True), (frozenset({"decision_maker"}), True), (frozenset({"router"}), True),
+    (frozenset({"router", "decision_maker"}), True),
+    (frozenset({"grader"}), False), (frozenset({"iteration2"}), False), (frozenset({"router", "grader"}), False),
+    (frozenset({"decision_maker", "iteration2"}), False), (frozenset({"router", "decision_maker", "grader"}), False),
+])
+def test_submission_rule_ablation_sets(ablate, ok):      # R54: the other conditions all hold, only the ablation set varies
+    ids = ["c1", "c2"]
+    allowed, reason = runner.submission_rule("test", "", ablate, False, ids, set(ids))
+    assert allowed is ok
+    assert (reason == "ok") if ok else ("candidate configurations" in reason)
 
 
 def test_console_prints_no_page_text(tmp_path, capsys):
@@ -247,9 +279,9 @@ def test_cache_only_rerun_is_byte_identical(tmp_path):
     ("test", "", frozenset(), False, True),
     ("test", "", frozenset({"decision_maker"}), False, True),
     ("test", "", frozenset({"grader"}), False, False),
-    ("test", "", frozenset({"router"}), False, False),
+    ("test", "", frozenset({"router"}), False, True),                       # R54 (was refused under R4 alone)
     ("test", "", frozenset({"iteration2"}), False, False),
-    ("test", "", frozenset({"decision_maker", "router"}), False, False),
+    ("test", "", frozenset({"decision_maker", "router"}), False, True),     # R54 (was refused under R4 alone)
     ("test", "s1", frozenset(), False, False),
     ("test", "", frozenset(), True, False),
     ("train", "", frozenset(), False, False),

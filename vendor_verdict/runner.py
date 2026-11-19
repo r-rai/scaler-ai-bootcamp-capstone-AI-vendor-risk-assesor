@@ -11,7 +11,7 @@ the first 8 hex digits of the sha1 of the sorted, comma-joined --only ids, never
 - `preds.csv` (id, verdict) for every finished case, in case-id order (never completion order), so a cache-only rerun is byte-identical;
 - `run.json`: counts only (see `run`); Task 9's gates read it, so its field names are a contract;
 - `traces/<case_id>.json` and `.md`; `graph.mmd`;
-- `submission.csv` only under `submission_rule` (ruling R4). It is never uploaded.
+- `submission.csv` only under `submission_rule` (ruling R4, amended by R54: the four candidate ablation sets). It is never uploaded.
 Every earlier output in `--out` is removed when a run starts, so a stale submission can never sit next to a later partial run. Write
 order: the submission goes to a temp file first (its self-check needs the file), then run.json (atomically), then the temp file is
 renamed to submission.csv: a crash leaves at worst a run.json without its submission, never a submission without its run.json.
@@ -84,7 +84,8 @@ from .safe import safe_id
 from .trace import Trace
 
 ROLES = ("planner", "specialist", "router", "grader", "decision_maker")
-SUBMISSION_ABLATIONS = (frozenset(), frozenset({"decision_maker"}))     # R4: the only ablation gates.candidate() can select
+# R4 amended by R54: the only ablation sets gates.candidate() can select (the router-off pair is its R53 fallback)
+SUBMISSION_ABLATIONS = (frozenset(), frozenset({"decision_maker"}), frozenset({"router"}), frozenset({"router", "decision_maker"}))
 _NODE_ROLE = {"plan": "planner", "specialists": "specialist", "route_pages": "router", "grade_evidence": "grader",
               "decide_conflicts": "decision_maker"}
 _FLAG_ROLE = {"planner_failures": "planner", "specialist_failures": "specialist", "case_read_failures": "specialist",
@@ -323,14 +324,15 @@ def _roles(cache: RoleCache, llms: list[GuardedLLM], flags: Counter, seconds: Co
 
 # ------------------------------------------------------------------------------------------------ rules and paths
 def submission_rule(split: str, salt: str, ablate, partial: bool, ids, test_case_ids) -> tuple[bool, str]:
-    """(write submission.csv?, why). Ruling R4: the test split, no salt, not partial, ablate empty or exactly {decision_maker}; and, as
+    """(write submission.csv?, why). Ruling R4 amended by R54: the test split, no salt, not partial, ablate exactly one of the sets
+    `gates.candidate()` can select (empty, {decision_maker}, and the router-off fallback {router}, {router, decision_maker}); and, as
     run_kaggle requires, the run covers every test case and nothing else (write_submission would fill a missing case with UNKNOWN)."""
     if split != "test":
         return False, "not the test split"
     if salt:
         return False, "salted run: a noise sample, never a candidate"
     if frozenset(ablate) not in SUBMISSION_ABLATIONS:
-        return False, "ablation other than decision_maker"
+        return False, "ablation outside the candidate configurations"
     if partial:
         return False, "partial run"
     if set(ids) != set(test_case_ids):
