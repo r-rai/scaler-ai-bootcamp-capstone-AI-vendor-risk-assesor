@@ -19,6 +19,12 @@ class SpecialistOut(BaseModel):
     readings: list[FieldReading]
 
 
+class SpecialistRaw(BaseModel):
+    """The lenient reply shape the specialists are called with: each item is validated as a FieldReading on its own, so one
+    malformed reading never costs the page its good ones."""
+    readings: list[dict]
+
+
 class PageRoute(BaseModel):
     page_id: str
     families: list[str]
