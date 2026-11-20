@@ -800,24 +800,39 @@ class VendorResearcher:
             run.incident_queries.append(query)
             run.incident_results.extend(clean)
 
-    def _record_incident_search(self, profile: VendorProfile, run: _Run, vendor: str) -> None:
-        """SEC-9.3: when no page produced an incident claim, store what the incident search covered as a `searched` fact. The matcher
-        decides what that is worth (matcher._searched_no_incident); this only records, so the verdict stays deterministic and a saved
-        profile can be rescored. Live path only, never overrides a fact read from a page, needs a confirmed official domain, at least one
-        completed search and at least one result that names the vendor."""
-        if self.offline_search or "security_incidents" in profile.facts or not run.incident_queries or not profile.official_domain:
-            return
-        tokens = incident_scan.vendor_tokens(vendor, profile.official_domain)
-        named, flagged = incident_scan.scan_results(run.incident_results, tokens, profile.official_domain)
-        if not named:        # nothing about THIS vendor came back: an empty or generic search is not a finding, so no fact (as before)
-            return
+    def _incident_coverage(self, profile: VendorProfile, run: _Run, vendor: str, tokens: list[str]) -> SearchCoverage:
         # A page we read that stated an incident, whose claim scoring then dropped (low authority, rumour), is a hit: no fact came out of
         # it, but silence is not what we saw.
         dropped = sorted(u for u, cs in run.claims.items() if any(c.field == "security_incidents" and c.value for c in cs))
-        cov = SearchCoverage(queries=list(run.incident_queries), failed_queries=run.incident_failed, results=list(run.incident_results),
-                             vendor_tokens=tokens, vendor_phrases=incident_scan.vendor_phrases(vendor, profile.official_domain),
-                             official_domain=profile.official_domain, dropped_incident_claims=dropped,
-                             official_page_read=any(p.get("source_type") == "official" for p in run.clean.values()))
+        return SearchCoverage(queries=list(run.incident_queries), failed_queries=run.incident_failed, results=list(run.incident_results),
+                              vendor_tokens=tokens, vendor_phrases=incident_scan.vendor_phrases(vendor, profile.official_domain),
+                              official_domain=profile.official_domain, dropped_incident_claims=dropped,
+                              official_page_read=any(p.get("source_type") == "official" for p in run.clean.values()))
+
+    def _record_incident_search(self, profile: VendorProfile, run: _Run, vendor: str) -> None:
+        """SEC-9.3: keep what the incident search covered, so the matcher can decide on it (matcher._judge_coverage) and a saved profile can be
+        rescored and audited. Only records: the verdict stays deterministic. Live path only (offline there is no search, and no coverage means
+        exactly that to the matcher).
+        - A fact a page produced with an EMPTY list ("no incidents disclosed") gets the coverage attached, always: also when no result names the
+          vendor, every search failed, none ran or no official domain was confirmed, because each of those is a reason the matcher must not
+          accept the page's silence. Its value, level, sources and display stay what the page said.
+        - With no fact at all, a `searched` fact is created, but only with a confirmed official domain, a completed search and at least one
+          result that names the vendor (an empty or generic search is not a finding).
+        - A fact that lists incidents is left alone."""
+        if self.offline_search:
+            return
+        tokens = incident_scan.vendor_tokens(vendor, profile.official_domain)
+        existing = profile.facts.get("security_incidents")
+        if existing is not None:
+            if existing.evidence_level != "searched" and isinstance(existing.value, list) and not existing.value and existing.coverage is None:
+                existing.coverage = self._incident_coverage(profile, run, vendor, tokens)
+            return
+        if not run.incident_queries or not profile.official_domain:
+            return
+        named, flagged = incident_scan.scan_results(run.incident_results, tokens, profile.official_domain)
+        if not named:        # nothing about THIS vendor came back: an empty or generic search is not a finding, so no fact (as before)
+            return
+        cov = self._incident_coverage(profile, run, vendor, tokens)
         unique = len({r["url"] for r in run.incident_results})
         profile.facts["security_incidents"] = VendorFact(
             field="security_incidents", value=[], confidence=0.3, as_of=None, evidence_level="searched",

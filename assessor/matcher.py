@@ -28,7 +28,7 @@ from .claims import is_absence_statement
 from .config import REQUIREMENTS_FILE
 from .errors import record_error
 from .policy_rag import PolicyLibrary
-from .schemas import (AssessmentRequest, Overall, Requirement, RequirementResult, Verdict, VendorFact, VendorProfile)
+from .schemas import (AssessmentRequest, Overall, Requirement, RequirementResult, SearchCoverage, Verdict, VendorFact, VendorProfile)
 
 TIER_RANK = {"T1": 1, "T2": 2, "T3": 3}
 
@@ -234,18 +234,17 @@ def _shown(title: object) -> str:
     return "[title withheld: it contains instructions aimed at an AI]" if injection.scan(text) else text
 
 
-def _searched_no_incident(req: Requirement, fact: VendorFact) -> tuple[Verdict, str]:
-    """SEC-9.3 on a `searched` fact: no page stated an incident and we looked. Bounded on purpose (842bbc6: absence is not evidence):
-    PASS only when the search demonstrably covered THIS vendor and no result reports an incident, and then only as `searched`."""
-    not_established = "Incident history could not be established. Ask the vendor (and keep rumours out, SEC-9.4)."
-    ns = req.params.get("negative_search")
-    cov = fact.coverage
-    if not ns or cov is None or not cov.queries:
-        return "UNKNOWN", not_established
+_NOT_ESTABLISHED = "Incident history could not be established. Ask the vendor (and keep rumours out, SEC-9.4)."
+
+
+def _judge_coverage(ns: dict, cov: SearchCoverage) -> tuple[str, str, int, int]:
+    """What an incident search covered, judged once for every path that relies on it (a `searched` fact, a claimed `[]`).
+    Returns (kind, text, unique results, anchored results); kind is "hit", "gap" or "covered".
+    ORDER matters: a hit is checked first so thin coverage can never hide it behind a weaker answer."""
     unique = {str(r.get("url") or "") for r in cov.results}
     named, flagged = incident_scan.scan_results(cov.results, cov.vendor_tokens, cov.official_domain)
+    anchored = [r for r in named if incident_scan.is_anchored(r, cov.vendor_phrases, cov.official_domain)]
     if flagged or cov.dropped_incident_claims:
-        # A hit always reaches a person, however thin the rest of the search was: never hide it behind UNKNOWN.
         what = []
         if flagged:
             what.append(f"{len(flagged)} search result(s) name the vendor next to a security incident: "
@@ -253,23 +252,67 @@ def _searched_no_incident(req: Requirement, fact: VendorFact) -> tuple[Verdict, 
         if cov.dropped_incident_claims:
             what.append(f"{len(cov.dropped_incident_claims)} page(s) stated an incident but came from a source too weak to decide on: "
                         + ", ".join(cov.dropped_incident_claims[:3]))
-        return "NEEDS_REVIEW", ". ".join(what) + ". Read them before approval; a major incident in the last 24 months needs a published post-mortem."
+        return "hit", ". ".join(what) + ". Read them before approval; a major incident in the last 24 months needs a published post-mortem.", len(unique), len(anchored)
+    if not cov.queries:
+        return "gap", "No incident search completed.", len(unique), len(anchored)
     if not cov.official_domain or not cov.official_page_read:
-        return "UNKNOWN", not_established + " No page of the vendor's own site was read, so the search cannot be tied to this company."
+        return "gap", "No page of the vendor's own site was read, so the search cannot be tied to this company.", len(unique), len(anchored)
     if cov.failed_queries:
-        return "UNKNOWN", not_established + f" {cov.failed_queries} incident search(es) failed; the answer they did not give may have been a hit."
-    anchored = [r for r in named if incident_scan.is_anchored(r, cov.vendor_phrases, cov.official_domain)]
+        return "gap", f"{cov.failed_queries} incident search(es) failed; the answer they did not give may have been a hit.", len(unique), len(anchored)
     if len(unique) < int(ns.get("min_results", 3)) or len(anchored) < int(ns.get("min_vendor_results", 2)):
-        return "UNKNOWN", (f"{not_established} The incident search returned {len(unique)} result(s), {len(named)} naming the vendor and "
-                           f"{len(anchored)} unmistakably about it: too little for silence to mean anything.")
-    return "PASS", (f"No incident report found: {len(unique)} search results over {len(cov.queries)} incident search(es), {len(anchored)} "
+        return "gap", (f"The incident search returned {len(unique)} result(s), {len(named)} naming the vendor and "
+                       f"{len(anchored)} unmistakably about it: too little for silence to mean anything."), len(unique), len(anchored)
+    return "covered", "", len(unique), len(anchored)
+
+
+def _searched_no_incident(req: Requirement, fact: VendorFact) -> tuple[Verdict, str]:
+    """SEC-9.3 on a `searched` fact: no page stated an incident and we looked. Bounded on purpose (842bbc6: absence is not evidence):
+    PASS only when the search demonstrably covered THIS vendor and no result reports an incident, and then only as `searched`."""
+    ns = req.params.get("negative_search")
+    cov = fact.coverage
+    if not ns or cov is None or not cov.queries:
+        return "UNKNOWN", _NOT_ESTABLISHED
+    kind, text, unique, anchored = _judge_coverage(ns, cov)
+    if kind == "hit":
+        return "NEEDS_REVIEW", text      # a hit always reaches a person, however thin the rest of the search was
+    if kind == "gap":
+        return "UNKNOWN", f"{_NOT_ESTABLISHED} {text}"
+    return "PASS", (f"No incident report found: {unique} search results over {len(cov.queries)} incident search(es), {anchored} "
                     "unmistakably about the vendor, none reporting a security incident. Evidence level: searched. Absence of reports is not proof that no incident "
                     "happened; the vendor's own answer (questionnaire item Q-SEC-9.3) is still needed.")
+
+
+def _checked_empty_claim(req: Requirement, fact: VendorFact) -> Optional[tuple[Verdict, str]]:
+    """SEC-9.3 on a fact a PAGE produced with an empty list ("no incidents disclosed"), when the research layer also recorded what the incident
+    search covered (live path). None = nothing to add, the existing rule decides (no coverage means no search was run: offline, or a profile saved
+    before this check). Whatever the level, a result that reports an incident goes to a person; a claimed or third-party statement passes only when
+    the search demonstrably covered the vendor too (the same bounds as a `searched` fact), otherwise it goes to a person as well."""
+    ns = req.params.get("negative_search")
+    cov = fact.coverage
+    if not ns or cov is None:
+        return None
+    kind, text, unique, anchored = _judge_coverage(ns, cov)
+    said = f"A page says no incident was disclosed ({fact.evidence_level} evidence)"
+    if kind == "hit":
+        return "NEEDS_REVIEW", f"{said}, but {text}"
+    if fact.evidence_level not in (req.params.get("confirm_empty_levels") or []):
+        return None
+    if kind == "gap":
+        return "NEEDS_REVIEW", (f"{said}, and that is not enough on its own: the search could not confirm it. {text} "
+                                "Ask the vendor (questionnaire item Q-SEC-9.3).")
+    return "PASS", (f"{said}, and the incident search found no report either: {unique} search results over {len(cov.queries)} incident search(es), "
+                    f"{anchored} unmistakably about the vendor, none reporting a security incident. Evidence level: {fact.evidence_level}, "
+                    "confirmed by a search. Absence of reports is not proof that no incident happened; the vendor's own answer "
+                    "(questionnaire item Q-SEC-9.3) is still needed.")
 
 
 def rule_no_unresolved_incident(req: Requirement, fact: Optional[VendorFact], ctx: dict) -> tuple[Verdict, str]:
     if fact is not None and fact.evidence_level == "searched" and not fact.value:
         return _searched_no_incident(req, fact)
+    if fact is not None and isinstance(fact.value, list) and not fact.value:
+        checked = _checked_empty_claim(req, fact)
+        if checked is not None:
+            return checked
     if fact is None or fact.value is None:
         return "UNKNOWN", "Incident history could not be established. Ask the vendor (and keep rumours out, SEC-9.4)."
     as_of: date = ctx["as_of"]

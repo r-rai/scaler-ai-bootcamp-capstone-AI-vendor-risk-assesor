@@ -131,6 +131,10 @@ requirements:
       # vendor's own site read. See matcher._searched_no_incident and assessor/incident_scan.py. Thresholds fixed 2026-11-20 before
       # the live run that audits them (reports/sec93_20261120/preregistration.md); removing this parameter turns the rule off.
       negative_search: { min_results: 3, min_vendor_results: 2 }
+      # A page that says "no incidents disclosed" (an empty list) is checked against the same incident search: a result reporting an incident
+      # sends it to a person at any level, and at these levels it passes only when the search covered the vendor too (same bounds as above).
+      # Needs `negative_search`; without coverage (offline, old saved profiles) nothing changes. reports/sec93_claimed_20261120/preregistration.md
+      confirm_empty_levels: ["claimed", "third_party"]
     severity: blocker
     applies_when: { tiers: ["T3"] }
 

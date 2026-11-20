@@ -174,7 +174,7 @@ class VendorFact(BaseModel):
     conflicts: list[str] = Field(default_factory=list, description="Other values seen, with their sources")
     history: list[str] = Field(default_factory=list, description="Older values that a newer source superseded")
     unresolved_conflict: bool = Field(default=False, description="A comparable, equally recent source disagrees")
-    coverage: Optional[SearchCoverage] = Field(default=None, description="Only for evidence_level 'searched': what the search covered")
+    coverage: Optional[SearchCoverage] = Field(default=None, description="What the incident search covered: set on a `searched` fact and on an empty-list fact a page produced (live path). None = no search was run")
 
 
 class VendorProfile(BaseModel):
