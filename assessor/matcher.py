@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 import yaml
 
+from . import incident_scan, injection
 from .claims import is_absence_statement
 from .config import REQUIREMENTS_FILE
 from .errors import record_error
@@ -208,7 +209,49 @@ def rule_retention_within(req: Requirement, fact: Optional[VendorFact], ctx: dic
     return "FAIL", f"Default retention {default_days} days and deletion on request {on_request} days both exceed {max_days}."
 
 
+def _shown(title: object) -> str:
+    """A search-result title goes into the reason, which people read (report, vendor questionnaire). It is untrusted text like a page:
+    one that carries an instruction aimed at an AI is replaced, the result still counts as a hit."""
+    text = " ".join(str(title or "").split())[:90]
+    return "[title withheld: it contains instructions aimed at an AI]" if injection.scan(text) else text
+
+
+def _searched_no_incident(req: Requirement, fact: VendorFact) -> tuple[Verdict, str]:
+    """SEC-9.3 on a `searched` fact: no page stated an incident and we looked. Bounded on purpose (842bbc6: absence is not evidence):
+    PASS only when the search demonstrably covered THIS vendor and no result reports an incident, and then only as `searched`."""
+    not_established = "Incident history could not be established. Ask the vendor (and keep rumours out, SEC-9.4)."
+    ns = req.params.get("negative_search")
+    cov = fact.coverage
+    if not ns or cov is None or not cov.queries:
+        return "UNKNOWN", not_established
+    unique = {str(r.get("url") or "") for r in cov.results}
+    named, flagged = incident_scan.scan_results(cov.results, cov.vendor_tokens, cov.official_domain)
+    if flagged or cov.dropped_incident_claims:
+        # A hit always reaches a person, however thin the rest of the search was: never hide it behind UNKNOWN.
+        what = []
+        if flagged:
+            what.append(f"{len(flagged)} search result(s) name the vendor next to a security incident: "
+                        + "; ".join(_shown(r.get("title") or r.get("url")) for r in flagged[:3]))
+        if cov.dropped_incident_claims:
+            what.append(f"{len(cov.dropped_incident_claims)} page(s) stated an incident but came from a source too weak to decide on: "
+                        + ", ".join(cov.dropped_incident_claims[:3]))
+        return "NEEDS_REVIEW", ". ".join(what) + ". Read them before approval; a major incident in the last 24 months needs a published post-mortem."
+    if not cov.official_domain or not cov.official_page_read:
+        return "UNKNOWN", not_established + " No page of the vendor's own site was read, so the search cannot be tied to this company."
+    if cov.failed_queries:
+        return "UNKNOWN", not_established + f" {cov.failed_queries} incident search(es) failed; the answer they did not give may have been a hit."
+    anchored = [r for r in named if incident_scan.is_anchored(r, cov.vendor_phrases, cov.official_domain)]
+    if len(unique) < int(ns.get("min_results", 3)) or len(anchored) < int(ns.get("min_vendor_results", 2)):
+        return "UNKNOWN", (f"{not_established} The incident search returned {len(unique)} result(s), {len(named)} naming the vendor and "
+                           f"{len(anchored)} unmistakably about it: too little for silence to mean anything.")
+    return "PASS", (f"No incident report found: {len(unique)} search results over {len(cov.queries)} incident search(es), {len(anchored)} "
+                    "unmistakably about the vendor, none reporting a security incident. Evidence level: searched. Absence of reports is not proof that no incident "
+                    "happened; the vendor's own answer (questionnaire item Q-SEC-9.3) is still needed.")
+
+
 def rule_no_unresolved_incident(req: Requirement, fact: Optional[VendorFact], ctx: dict) -> tuple[Verdict, str]:
+    if fact is not None and fact.evidence_level == "searched" and not fact.value:
+        return _searched_no_incident(req, fact)
     if fact is None or fact.value is None:
         return "UNKNOWN", "Incident history could not be established. Ask the vendor (and keep rumours out, SEC-9.4)."
     as_of: date = ctx["as_of"]
@@ -314,4 +357,8 @@ class Matcher:
             if open_items:
                 parts.append(f"{len(open_items)} item(s) need evidence or a human decision: " + ", ".join(r.requirement_id for r in open_items))
             return "CONDITIONAL", "; ".join(parts).capitalize() + "."
+        searched = [r.requirement_id for r in results if r.verdict == "PASS" and r.evidence_level == "searched"]
+        if searched:
+            return "READY_FOR_APPROVAL", (f"Every applicable requirement passed, but {', '.join(searched)} rests on a search that found no report, "
+                                          "not on documented evidence (absence of reports is not proof). A human approver still decides (AI-5.1).")
         return "READY_FOR_APPROVAL", "Every applicable requirement passed on documented evidence. A human approver still decides (AI-5.1)."

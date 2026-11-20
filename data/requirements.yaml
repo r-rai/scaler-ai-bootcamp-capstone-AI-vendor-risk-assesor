@@ -125,6 +125,11 @@ requirements:
     params:
       lookback_months: 24
       major_severities: ["major", "critical"]
+      # A search that found no report may give PASS, but only as `searched` evidence (never proof of absence) and only when it
+      # demonstrably covered the vendor: at least 3 results, 2 of them naming it, no result reporting an incident, a page of the
+      # vendor's own site read. See matcher._searched_no_incident and assessor/incident_scan.py. Thresholds fixed 2026-11-20 before
+      # the live run that audits them (reports/sec93_20261120/preregistration.md); removing this parameter turns the rule off.
+      negative_search: { min_results: 3, min_vendor_results: 2 }
     severity: blocker
     applies_when: { tiers: ["T3"] }
 

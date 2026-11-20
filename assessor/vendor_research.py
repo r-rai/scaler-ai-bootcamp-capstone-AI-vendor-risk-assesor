@@ -41,14 +41,14 @@ from typing import Any, Optional
 
 import yaml
 
-from . import fetching, injection
+from . import fetching, incident_scan, injection
 from .claims import normalise_claim
 from .config import DATA_DIR, REAL_VENDOR_CORPUS, SETTINGS, VENDOR_CORPUS
 from .llm import LLM, LLMError
 from .memory import VendorMemory
 from .schemas import (
     BaseModel, Claim, ClaimList, Evidence, FIELD_DESCRIPTIONS, HIGH_STAKES_FIELDS, LIST_FIELDS,
-    PlanDecision, PlanReview, ResearchPlan, SourceMeta, SubQuestion, VENDOR_FIELDS, VendorFact, VendorProfile,
+    PlanDecision, PlanReview, ResearchPlan, SearchCoverage, SourceMeta, SubQuestion, VENDOR_FIELDS, VendorFact, VendorProfile,
 )
 from .tracing import Budget, BudgetExceeded, Tracer
 
@@ -414,6 +414,9 @@ class _Run:
     queries_used: dict[str, list[str]] = field(default_factory=dict)
     page_drops: list[str] = field(default_factory=list)
     seen_urls: set[str] = field(default_factory=set)
+    incident_queries: list[str] = field(default_factory=list)     # completed searches for the security_incidents field
+    incident_results: list[dict] = field(default_factory=list)    # their raw results (url, title, snippet): the base of a `searched` fact
+    incident_failed: int = 0
     counter: int = 0
     stopped: str = ""
     closed: bool = False        # set at the deadline: work still in flight must not touch the result any more
@@ -783,6 +786,44 @@ class VendorResearcher:
                 new_claims += len(kept)
         return new_claims
 
+    def _note_incident_search(self, run: _Run, query: str, hits: list[dict]) -> None:
+        """Keep the raw results of an incident search. Late results after the deadline closed the run are not used."""
+        from .guardrails import redact_input    # local import: guardrails imports the LLM layer
+
+        # Stored in the profile and the assessments DB, so contact details are removed on the way in (titles and snippets are third-party text).
+        clean = [{"url": str(h.get("url") or ""), "title": redact_input(str(h.get("title") or "")[:200])[0],
+                  "snippet": redact_input(str(h.get("snippet") or "")[:300])[0]} for h in hits]
+        with run.lock:
+            if run.closed:
+                return
+            run.incident_queries.append(query)
+            run.incident_results.extend(clean)
+
+    def _record_incident_search(self, profile: VendorProfile, run: _Run, vendor: str) -> None:
+        """SEC-9.3: when no page produced an incident claim, store what the incident search covered as a `searched` fact. The matcher
+        decides what that is worth (matcher._searched_no_incident); this only records, so the verdict stays deterministic and a saved
+        profile can be rescored. Live path only, never overrides a fact read from a page, needs a confirmed official domain, at least one
+        completed search and at least one result that names the vendor."""
+        if self.offline_search or "security_incidents" in profile.facts or not run.incident_queries or not profile.official_domain:
+            return
+        tokens = incident_scan.vendor_tokens(vendor, profile.official_domain)
+        named, flagged = incident_scan.scan_results(run.incident_results, tokens, profile.official_domain)
+        if not named:        # nothing about THIS vendor came back: an empty or generic search is not a finding, so no fact (as before)
+            return
+        # A page we read that stated an incident, whose claim scoring then dropped (low authority, rumour), is a hit: no fact came out of
+        # it, but silence is not what we saw.
+        dropped = sorted(u for u, cs in run.claims.items() if any(c.field == "security_incidents" and c.value for c in cs))
+        cov = SearchCoverage(queries=list(run.incident_queries), failed_queries=run.incident_failed, results=list(run.incident_results),
+                             vendor_tokens=tokens, vendor_phrases=incident_scan.vendor_phrases(vendor, profile.official_domain),
+                             official_domain=profile.official_domain, dropped_incident_claims=dropped,
+                             official_page_read=any(p.get("source_type") == "official" for p in run.clean.values()))
+        unique = len({r["url"] for r in run.incident_results})
+        profile.facts["security_incidents"] = VendorFact(
+            field="security_incidents", value=[], confidence=0.3, as_of=None, evidence_level="searched",
+            display=(f"Incident search: {unique} results, {len(named)} naming the vendor, {len(flagged)} reporting an incident "
+                     "(absence of reports is not proof)"),
+            sources=[r["url"] for r in named[:5]], coverage=cov)
+
     def _seconds_left(self) -> Optional[float]:
         return None if not self.budget.max_seconds else self.budget.max_seconds - self.budget.elapsed_s
 
@@ -835,9 +876,14 @@ class VendorResearcher:
                     hits = fetching.search(q, SETTINGS.results_per_query, refresh=run.refresh, budget=self.budget, run_id=self._run_id)
                 except Exception as exc:  # noqa: BLE001
                     self._trace("search_failed", query=q, error=str(exc)[:160], sub_question=sq.id)
+                    if sq.field == "security_incidents":
+                        with run.lock:
+                            run.incident_failed += 1
                     continue
                 self._trace("search", query=q, results=len(hits), sub_question=sq.id, iteration=iteration,
                             provider=hits[0]["provider"] if hits else None)
+                if sq.field == "security_incidents":
+                    self._note_incident_search(run, q, hits)
                 for h in self._rank_hits(sq, hits, official_domain):
                     with lock:
                         page_futs.append(pool.submit(page_job, h))
@@ -1040,6 +1086,7 @@ class VendorResearcher:
         diffs = self.memory.record_assessment(profile, lessons=self._lessons(profile, dup_of) if self.use_memory else None)
         if diffs:
             profile.notes.append("Changes since previous review (SEC-12.1): " + "; ".join(diffs[:4]))
+        self._record_incident_search(profile, run, vendor)   # after memory: a search record is not a fact the vendor stated (SEC-12.1)
         self._trace("research_done", facts=list(profile.facts), iterations=iteration)
         return profile
 

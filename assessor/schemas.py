@@ -91,6 +91,10 @@ EvidenceLevel = Literal[
     "rumour",       # forum, social media, unnamed sources
 ]
 
+# What a FACT (as opposed to a claim) can rest on. "searched" is not something any source states: we looked and found no report.
+# It says nothing about whether one exists, and only SEC-9.3 uses it (see SearchCoverage, matcher.rule_no_unresolved_incident).
+FactLevel = Literal["documented", "claimed", "third_party", "rumour", "searched"]
+
 SourceType = Literal[
     "regulator",        # certification body registry, government register
     "official",         # the vendor's own site: trust centre, legal, status page
@@ -145,17 +149,32 @@ class Evidence(BaseModel):
     duplicate_of: Optional[str] = Field(default=None, description="Source id this page copies, if any")
 
 
+class SearchCoverage(BaseModel):
+    """What a "we searched and found nothing" fact rests on, stored with the fact so the verdict can be audited and rescored from a
+    saved profile. Raw results only (url, title, snippet): the matcher applies the incident wording at verdict time."""
+
+    queries: list[str] = Field(default_factory=list, description="Incident queries that completed, across research passes")
+    failed_queries: int = 0
+    results: list[dict] = Field(default_factory=list, description="url / title / snippet of every result, as returned")
+    vendor_tokens: list[str] = Field(default_factory=list, description="Words that mean this vendor in a result")
+    vendor_phrases: list[str] = Field(default_factory=list, description="Two-word name and domain: what makes a result unmistakably about this vendor")
+    official_domain: Optional[str] = None
+    official_page_read: bool = Field(default=False, description="A page of the vendor's own site was read and passed the gates")
+    dropped_incident_claims: list[str] = Field(default_factory=list, description="Pages that stated an incident whose claim scoring dropped (low authority, rumour): still a hit")
+
+
 class VendorFact(BaseModel):
     field: VendorField
     value: Any
     display: str
     confidence: float = Field(ge=0, le=1)
     as_of: Optional[date] = None
-    evidence_level: EvidenceLevel
+    evidence_level: FactLevel
     sources: list[str] = Field(default_factory=list, description="URLs that support the chosen value")
     conflicts: list[str] = Field(default_factory=list, description="Other values seen, with their sources")
     history: list[str] = Field(default_factory=list, description="Older values that a newer source superseded")
     unresolved_conflict: bool = Field(default=False, description="A comparable, equally recent source disagrees")
+    coverage: Optional[SearchCoverage] = Field(default=None, description="Only for evidence_level 'searched': what the search covered")
 
 
 class VendorProfile(BaseModel):
@@ -283,7 +302,7 @@ class RequirementResult(BaseModel):
     reason: str
     evidence_urls: list[str] = Field(default_factory=list)
     evidence_as_of: Optional[date] = None
-    evidence_level: Optional[EvidenceLevel] = None
+    evidence_level: Optional[FactLevel] = None
     vendor_question_id: Optional[str] = Field(default=None, description="Questionnaire item to send if UNKNOWN / NEEDS_REVIEW")
 
 
