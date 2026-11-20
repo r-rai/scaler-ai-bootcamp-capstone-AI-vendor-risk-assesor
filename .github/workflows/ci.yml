@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, master, prod-hardening]
   pull_request:
+  workflow_dispatch:      # so a run can be started by hand from the Actions tab
 
 # Mock/offline is the default everywhere below: no job needs a model key, a GPU or the live web.
 env:
