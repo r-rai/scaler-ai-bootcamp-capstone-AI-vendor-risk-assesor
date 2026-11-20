@@ -61,7 +61,7 @@ Each assessment writes `runs/<timestamp>-assess/`:
 Tests and evaluation:
 
 ```bash
-python -m pytest -q              # 70 tests
+python -m pytest -q              # 1478 tests (1477 pass, 2 skip without fastapi)
 python eval/run_eval.py          # scorecard against data/gold_set.json → reports/eval_report.md
 python eval/run_eval.py --strict # exit 1 on a failed threshold (use in CI)
 ```
@@ -69,7 +69,8 @@ python eval/run_eval.py --strict # exit 1 on a failed threshold (use in CI)
 ## 3. Switch on a real LLM and real search (after the offline run is green)
 
 Edit `.env`: pick one `LLM_PROVIDER` block (Gemini and Groq have free tiers; Ollama is local) and set
-`SEARCH_PROVIDER=ddgs` (no key) or `tavily`. Install the extras: `pip install openai ddgs trafilatura httpx`.
+`SEARCH_PROVIDER=ddgs` (no key) or `tavily`. Install the extras: `pip install -r requirements-prod.txt`
+(or the individual ones: `pip install openai ddgs trafilatura httpx`).
 Then assess a **real** vendor:
 
 ```bash
@@ -96,7 +97,7 @@ assessor/
   graph.py            the orchestrator: plain Python AND LangGraph, same nodes
   llm.py / tracing.py / config.py   provider wrapper, trace + budget, settings
 data/
-  policies/           8 Nimbu Mart documents + _metadata.json (access, status, trust)
+  policies/           11 Nimbu Mart documents + _metadata.json (access, status, trust)
   requirements.yaml   11 machine-checkable rules, each tied to a clause
   vendor_web/corpus.json   the fictional web: 23 pages, deliberately messy
   gold_set.json       hand-checked expected verdicts (5 cases) + policy questions
@@ -119,12 +120,15 @@ the course module/lab to use.
 6. **Access control lives in retrieval.** The Approved Vendor List is invisible to people outside Security/Procurement, and the assistant says so instead of leaking it.
 7. **Humans approve.** The report ends in an approval block that only a named person can fill.
 
-All companies, people, domains and documents in `data/` are fictional and were written for this course.
+Everything in `data/policies/`, `data/vendor_web/corpus.json` and `data/gold_set.json` is fictional and was written for this
+course. `data/gold_set_real.json` and `data/vendor_web/real_vendors_corpus.json` are the exception: they hold cached
+snapshots of **real** vendor trust pages (Zoho, Freshworks, LiveKit, Notion, Anthropic, OpenAI and four others) so the
+real-vendor evaluation runs offline and deterministically in CI.
 
 ## 6. Running it as a service (production hardening)
 
-Branch `prod-hardening`. Every setting is documented in `.env.example`; mock/offline stays the default, so CI and the
-demo need no key, network or GPU.
+Production hardening (hash-chained audit log, hashed-token auth, SSRF-safe fetching, caches, metrics). Every setting is
+documented in `.env.example`; mock/offline stays the default, so CI and the demo need no key, network or GPU.
 
 **What was added.** Hashed-token auth and role-checked, multi-signature approvals (T3 needs Head of InfoSec and DPO;
 the requester cannot approve; BLOCKED cannot be approved); a hash-chained audit log (`scripts/verify_audit.py`);

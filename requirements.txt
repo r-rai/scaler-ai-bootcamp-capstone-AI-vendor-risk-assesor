@@ -3,6 +3,10 @@ pydantic>=2.7            # contracts between stages (schemas.py)
 pyyaml>=6.0              # data/requirements.yaml
 python-dotenv>=1.0       # reads .env
 pytest>=8                # python -m pytest -q
+numpy>=1.26              # assessor/policy_rag.py, assessor/rag_core.py, assessor/cache.py import it at module level
+lxml>=5.0                # hidden-text extraction in assessor/fetching.py (guarded, but 3 tests need it)
+pandas>=2.0              # eval/run_kaggle.py submission self-check and eval/compare_samples.py
+httpx>=0.27              # assessor/fetching.py page downloads (also arrives via langgraph, but it is a direct import)
 
 # --- orchestration --------------------------------------------------------------
 langgraph>=1.0           # graph engine (the plain-Python engine works without it)
