@@ -544,7 +544,9 @@ class VendorResearcher:
                     "text": "", "memory_flag": flag}
         try:
             self.budget.charge_tool("fetch", "sandbox" if SETTINGS.fetcher_url else "local")
-            page = fetching.fetch(url, refresh=run.refresh, vendor=vendor, run_id=self._run_id)
+            # The read-through context is only handed over when the fallback can run, so the call keeps its old shape otherwise.
+            context = {"official_domain": official_domain, "budget": self.budget} if fetching.firecrawl_available() else {}
+            page = fetching.fetch(url, refresh=run.refresh, vendor=vendor, run_id=self._run_id, **context)
         except fetching.UnsafeURL as exc:
             self._trace("ssrf_blocked", url=url, reason=str(exc)[:120])
             return None
@@ -552,7 +554,8 @@ class VendorResearcher:
             if not probe:
                 self._trace("fetch_failed", url=url, error=str(exc)[:120])
             return None
-        self._trace("fetch", url=url, chars=len(page["text"]), cached=page.get("from_cache", False), probe=probe)
+        self._trace("fetch", url=url, chars=len(page["text"]), cached=page.get("from_cache", False), probe=probe,
+                    **({"via": page["via"]} if page.get("via") else {}))
         return {
             "id": pid, "url": url, "title": page["title"] or hit.get("title", ""),
             "source_type": guess_source_type(page.get("final_url") or url, official_domain), "publisher": "",

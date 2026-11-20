@@ -53,7 +53,11 @@ class UnsafeURL(ValueError):
 
 
 class FetchError(RuntimeError):
-    pass
+    """A page could not be read. `status` is the HTTP status when the site itself refused (else None)."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 def host_of(url: str) -> str:
@@ -100,6 +104,12 @@ def check_url(url: str, *, resolve: bool = True) -> str:
     return url
 
 
+def firecrawl_available() -> bool:
+    """The fallback can run: a key, not switched off, and not in sandbox mode (the fetcher container exists so that
+    untrusted HTML is never parsed in the process that holds an API key)."""
+    return bool(SETTINGS.firecrawl_api_key and SETTINGS.firecrawl_enabled and not SETTINGS.fetcher_url)
+
+
 def _pace(host: str) -> None:
     """Be polite: space out requests to the same host. Each caller reserves the next free slot."""
     with _host_lock:
@@ -126,7 +136,7 @@ def _download(url: str) -> tuple[bytes, str, str]:
                     current = urljoin(current, r.headers["location"])
                     continue
                 if r.status_code >= 400:
-                    raise FetchError(f"HTTP {r.status_code}")
+                    raise FetchError(f"HTTP {r.status_code}", status=r.status_code)
                 ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
                 if ctype and not ctype.startswith(ALLOWED_TYPES):
                     raise FetchError(f"content type {ctype!r} is not read")
@@ -262,8 +272,90 @@ def _clean_remote_page(data: Any, url: str) -> dict[str, Any]:
     }
 
 
-def fetch(url: str, *, refresh: bool = False, vendor: str = "", run_id: str = "") -> dict[str, Any]:
-    """Cache → sandboxed fetcher (if configured) → local guarded download. Adds `from_cache`."""
+# ---------------------------------------------------------------------------
+# Firecrawl read-through (only when the vendor's own site refused our honest fetcher)
+# ---------------------------------------------------------------------------
+
+FALLBACK_STATUSES = (401, 403, 429, 503)      # what a site answers a bot it does not want; a 404 is not one of them
+FIRECRAWL_URL = "https://api.firecrawl.dev/v2/scrape"
+FIRECRAWL_MIN_TIME_LEFT_S = 5.0
+
+
+def _on_domain(url: str, domain: Optional[str]) -> bool:
+    d = (domain or "").lower().lstrip(".")
+    host = host_of(url)
+    return bool(d) and (host == d or host.endswith("." + d))
+
+
+def _read_through_firecrawl(url: str, refused: FetchError, official_domain: Optional[str], budget: Any) -> dict[str, Any]:
+    """The direct download was refused. Either re-raise `refused` untouched (the fallback does not apply) or return the
+    page read through Firecrawl, or raise a FetchError that still names the original refusal.
+
+    Plain HTML is requested (1 credit; extract/JSON, PDF and scan add-ons cost more and are never asked for) and parsed
+    by the same `_parse` as a direct download, so hidden text stays separate for the injection scanner. The key is only
+    ever in the request header; error messages carry the exception type, never its text.
+    """
+    import httpx
+
+    from . import costs
+
+    if refused.status not in FALLBACK_STATUSES or not firecrawl_available():
+        raise refused
+
+    def skipped(why: str) -> FetchError:
+        return FetchError(f"{refused} (firecrawl skipped: {why})", status=refused.status)
+
+    if budget is None:
+        raise skipped("no budget to count the call against") from None
+    if not _on_domain(url, official_domain):
+        raise skipped("not the assessed vendor's own domain") from None
+    if budget.max_seconds and budget.max_seconds - budget.elapsed_s < FIRECRAWL_MIN_TIME_LEFT_S:
+        raise skipped("not enough run time left") from None
+    if costs.firecrawl_credits_this_month() + budget.tools.get("fetch:firecrawl", 0) >= SETTINGS.firecrawl_monthly_credits:
+        raise skipped("monthly ceiling reached") from None
+    if not budget.reserve_tool("fetch", "firecrawl", SETTINGS.firecrawl_max_per_run):
+        raise skipped(f"per-assessment cap of {SETTINGS.firecrawl_max_per_run} reached") from None
+
+    timeout_s = SETTINGS.firecrawl_timeout_s
+    if budget.max_seconds:
+        timeout_s = max(1.0, min(timeout_s, budget.max_seconds - budget.elapsed_s - 1.0))
+
+    def failed(why: str, status: Optional[int] = None) -> FetchError:
+        return FetchError(f"{refused} (firecrawl: {why})", status=status if status is not None else refused.status)
+
+    try:
+        r = httpx.post(FIRECRAWL_URL, headers={"Authorization": f"Bearer {SETTINGS.firecrawl_api_key}"},
+                       json={"url": url, "formats": ["rawHtml"], "timeout": int(timeout_s * 1000)}, timeout=timeout_s + 5)
+    except httpx.HTTPError as exc:
+        raise failed(f"request failed, {type(exc).__name__}") from None
+    if r.status_code != 200:
+        raise failed(f"answered HTTP {r.status_code}") from None
+    try:
+        data = r.json()
+        body_data = data["data"]
+        html = body_data.get("rawHtml")
+        site_status = (body_data.get("metadata") or {}).get("statusCode")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise failed("unexpected answer") from None
+    if isinstance(site_status, int) and site_status >= 400:
+        raise failed(f"the site still answered HTTP {site_status}", status=site_status) from None
+    if not isinstance(html, str) or not html.strip():
+        raise failed("returned no page") from None
+    body = html.encode("utf-8", errors="replace")
+    if len(body) > SETTINGS.fetch_max_bytes:
+        raise failed(f"response larger than {SETTINGS.fetch_max_bytes} bytes") from None
+    page = _parse(body, "text/html", url)
+    page.update({"url": url, "final_url": url, "content_type": "text/html", "sha256": hashlib.sha256(body).hexdigest(),
+                 "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "via": "firecrawl"})
+    return page
+
+
+def fetch(url: str, *, refresh: bool = False, vendor: str = "", run_id: str = "",
+          official_domain: Optional[str] = None, budget: Any = None) -> dict[str, Any]:
+    """Cache → sandboxed fetcher (if configured) → local guarded download. Adds `from_cache`.
+
+    `official_domain` and `budget` are only needed for the Firecrawl read-through, which a refused local download may
+    fall back to (never in sandbox mode); without them a refusal is simply an error."""
     from .cache import get_cache
 
     cache = get_cache()
@@ -285,7 +377,10 @@ def fetch(url: str, *, refresh: bool = False, vendor: str = "", run_id: str = ""
             raise FetchError(str(r.json().get("detail", f"fetcher HTTP {r.status_code}"))[:200])
         page = _clean_remote_page(r.json(), url)
     else:
-        page = safe_fetch(url)
+        try:
+            page = safe_fetch(url)
+        except FetchError as refused:
+            page = _read_through_firecrawl(url, refused, official_domain, budget)
     if page["text"].strip():
         cache.put("page", url, page, ttl=SETTINGS.page_cache_ttl_s, tag=vendor)
     return {**page, "from_cache": False}

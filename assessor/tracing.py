@@ -108,6 +108,19 @@ class Budget:
             key = f"{stage}:{provider}"
             self.tools[key] = self.tools.get(key, 0) + 1
 
+    def reserve_tool(self, stage: str, provider: str, limit: int) -> bool:
+        """Count one call of a metered tool unless `limit` calls were already made. Check and count are one step under
+        the lock, so parallel workers cannot overshoot a cap together. The call is counted before it is made (it is billed
+        even when it fails)."""
+        with self._lock:
+            key = f"{stage}:{provider}"
+            if self.tools.get(key, 0) >= limit:
+                return False
+            self.tool_calls += 1
+            self._stage(stage)["tool_calls"] += 1
+            self.tools[key] = self.tools.get(key, 0) + 1
+            return True
+
     # -- checking -----------------------------------------------------------
     def restart_clock(self) -> None:
         """A Budget can outlive one question (a shared Pipeline); the wall clock is per run."""

@@ -81,6 +81,14 @@ class Settings:
     tavily_api_key: str = field(default_factory=lambda: _env("TAVILY_API_KEY", ""), repr=False)
     results_per_query: int = field(default_factory=lambda: _env_int("VRA_RESULTS_PER_QUERY", 5))
 
+    # --- Firecrawl: reads a page of the assessed vendor's own site when our honest fetcher is refused (HTTP 401/403/
+    # 429/503). Off without a key. The monthly figure is OUR ceiling, not the plan size. See fetching.py, GOVERNANCE.md §3.
+    firecrawl_api_key: str = field(default_factory=lambda: _env("FIRECRAWL_API_KEY", ""), repr=False)
+    firecrawl_enabled: bool = field(default_factory=lambda: _env("VRA_FIRECRAWL", "1") == "1")
+    firecrawl_max_per_run: int = field(default_factory=lambda: _env_int("VRA_FIRECRAWL_MAX_PER_RUN", 8))
+    firecrawl_monthly_credits: int = field(default_factory=lambda: _env_int("VRA_FIRECRAWL_MONTHLY_CREDITS", 300))
+    firecrawl_timeout_s: float = field(default_factory=lambda: _env_float("VRA_FIRECRAWL_TIMEOUT_S", 15.0))
+
     # --- Embeddings & Reranker (free local models or built-in fallback) -------
     embedder: str = field(default_factory=lambda: _env("EMBEDDER", "auto").lower())
     embed_model: str = field(default_factory=lambda: _env("EMBED_MODEL", "BAAI/bge-small-en-v1.5"))

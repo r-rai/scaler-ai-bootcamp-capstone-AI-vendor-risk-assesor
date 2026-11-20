@@ -16,6 +16,7 @@ os.environ["VRA_LOG_LEVEL"] = "WARNING"
 os.environ.setdefault("VRA_RUNS_DIR", tempfile.mkdtemp(prefix="vra-test-runs-"))
 for _k in ("LLM_SMALL_PROVIDER", "LLM_EXTRACT_PROVIDER", "VRA_TOKENS_FILE"):
     os.environ.pop(_k, None)
+os.environ["FIRECRAWL_API_KEY"] = ""    # a key in .env must never let the suite call (and pay) Firecrawl; tests that need one set it themselves
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:

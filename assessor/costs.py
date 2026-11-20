@@ -33,6 +33,11 @@ def _month_start() -> str:
     return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
 
 
+def firecrawl_credits_this_month(db_path: Path | None = None) -> int:
+    """Firecrawl scrapes recorded since the start of the month (a basic scrape is 1 credit; failed ones count too)."""
+    return tool_calls_since(_month_start(), "fetch", "firecrawl", db_path)
+
+
 def spend_summary(db_path: Path | None = None) -> dict[str, Any]:
     today, month = spend_since(_day_start(), db_path), spend_since(_month_start(), db_path)
 

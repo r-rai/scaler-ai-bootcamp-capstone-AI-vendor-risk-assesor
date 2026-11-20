@@ -55,6 +55,7 @@ Local-model selection (bake-off in `scripts/bakeoff_local_llm.py`): Qwen3-4B sco
 | Vendor name and search queries | Yes | Tavily and/or DuckDuckGo |
 | Public vendor page text | Yes, for extraction | MiniMax |
 | Page downloads | The fetch itself reaches the vendor's site from this machine's IP (or from the `fetcher` container) | vendor and third-party sites |
+| URL of a page the vendor's own site refused to our fetcher (HTTP 401/403/429/503) | Yes, only when `FIRECRAWL_API_KEY` is set, only for the assessed vendor's own domain, at most `VRA_FIRECRAWL_MAX_PER_RUN` per assessment and `VRA_FIRECRAWL_MONTHLY_CREDITS` per month, never in sandbox mode. The URL names the vendor under review; no question text, policy text or answer is sent. Firecrawl returns the page, which is parsed and scanned like any other. Each use is marked `via=firecrawl` in the trace. Firecrawl's own bot-protection handling is why this works: some sites' terms forbid automated access, and whether Firecrawl honors `robots.txt` was not verified (this fetcher does not read `robots.txt` either). | Firecrawl |
 | Reports, approvals, audit log, caches | No | local SQLite under `runs/` |
 
 ## 4. Risk register
