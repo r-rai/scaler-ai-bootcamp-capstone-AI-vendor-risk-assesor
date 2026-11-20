@@ -551,8 +551,8 @@ class VendorResearcher:
             self._trace("ssrf_blocked", url=url, reason=str(exc)[:120])
             return None
         except Exception as exc:  # noqa: BLE001
-            if not probe:
-                self._trace("fetch_failed", url=url, error=str(exc)[:120])
+            # A failed probe is traced under its own stage: it can cost a paid fallback call, and a call with no trace cannot be audited.
+            self._trace("probe_failed" if probe else "fetch_failed", url=url, error=str(exc)[:120])
             return None
         self._trace("fetch", url=url, chars=len(page["text"]), cached=page.get("from_cache", False), probe=probe,
                     **({"via": page["via"]} if page.get("via") else {}))

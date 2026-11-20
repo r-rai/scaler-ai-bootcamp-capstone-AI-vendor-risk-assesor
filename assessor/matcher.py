@@ -282,6 +282,12 @@ class Matcher:
                     record_error("matcher:rule", exc, {"requirement": req.id, "rule": req.rule, "vendor": request.vendor})
                     verdict, reason = "UNKNOWN", ("The evidence found for this requirement could not be interpreted, "
                                                   "so it is treated as not established. Ask the vendor.")
+                decisive = req.params.get("decisive_levels")
+                if decisive and fact is not None and verdict in ("PASS", "FAIL") and fact.evidence_level not in decisive:
+                    # Whoever says it matters for a blocker: weaker evidence than the requirement asks for may not decide PASS or
+                    # FAIL either way. (rule_enum_verdict applies the same test itself for AI-2.1; this covers every other rule.)
+                    verdict, reason = "NEEDS_REVIEW", (f"{fact.display}. Only {fact.evidence_level} evidence (a decision here needs "
+                                                       f"{' or '.join(decisive)}); confirm with the vendor's own terms.")
             q_id = None
             if verdict in ("UNKNOWN", "NEEDS_REVIEW"):
                 q_id = QUESTION_FOR_CLAUSE.get(req.clause)
