@@ -22,6 +22,7 @@ is what turns fragile LLM output into a contract (Deep Search Module 4, Lab 2).
 from __future__ import annotations
 
 import json
+import queue
 import re
 import threading
 import time
@@ -40,9 +41,11 @@ class LLMError(RuntimeError):
 REASONING_EFFORT_PROVIDERS = frozenset({"minimax", "openai", "openrouter"})   # accept reasoning_effort
 BREAKER_THRESHOLD = 3      # consecutive failures before a provider is skipped
 BREAKER_COOLDOWN_S = 60.0
+HEDGE_MIN_LEFT_S = 6.0     # a duplicate that cannot finish before the run's deadline is pure waste
 _BREAKERS: dict[str, dict[str, float]] = {}
 _CLIENTS: dict[tuple[str, str], object] = {}
 _STATE_LOCK = threading.Lock()
+_HEDGE_TLS = threading.local()   # `_create` leaves the hedge details of the call it just made for `_complete` (same thread)
 
 
 def breaker_open(provider: str) -> bool:
@@ -179,8 +182,9 @@ class LLM:
         if self.tracer:
             self.tracer.event(stage, **data)
 
-    def _create(self, cfg: dict, messages: list[dict], *, json_mode: bool = False, schema: dict | None = None,
-                schema_name: str = "output", tools: list[dict] | None = None):
+    def _create_once(self, cfg: dict, messages: list[dict], *, json_mode: bool = False, schema: dict | None = None,
+                     schema_name: str = "output", tools: list[dict] | None = None, retries: int | None = None):
+        """ONE request to one endpoint (the SDK may retry it inside its own limits). `retries` can only lower those limits."""
         kwargs: dict = {"model": cfg["model"], "messages": messages}
         if tools:
             kwargs["tools"], kwargs["tool_choice"] = tools, "auto"
@@ -199,9 +203,11 @@ class LLM:
         elif json_mode and cfg["provider"] != "ollama":
             kwargs["response_format"] = {"type": "json_object"}
         client = _client(cfg)
-        timeout, retries = self._call_limits(cfg)
-        if (timeout, retries) != (SETTINGS.llm_timeout_s, 0 if cfg.get("local") else 2):
-            client = client.with_options(timeout=timeout, max_retries=retries)
+        timeout, sdk_retries = self._call_limits(cfg)
+        if retries is not None:
+            sdk_retries = min(sdk_retries, retries)
+        if (timeout, sdk_retries) != (SETTINGS.llm_timeout_s, 0 if cfg.get("local") else 2):
+            client = client.with_options(timeout=timeout, max_retries=sdk_retries)
         try:
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
@@ -216,6 +222,85 @@ class LLM:
             kwargs.pop("response_format", None)
             kwargs.pop("reasoning_effort", None)
             return client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+
+    def _create(self, cfg: dict, messages: list[dict], **kw):
+        """The response of one logical request (see `_send`). This is the one seam every provider call goes through (the
+        egress tests replace it to prove restricted text never reaches a cloud call), so `_complete` calls it and nothing
+        else; the details of a hedge travel to `_complete` through a thread-local, because the response is all it returns."""
+        resp, hedge = self._send(cfg, messages, **kw)
+        _HEDGE_TLS.info = hedge
+        return resp
+
+    def _hedge_after(self, cfg: dict) -> float:
+        """Seconds after which this call gets a duplicate request; 0 = this call is never hedged. Only the page reader on
+        a cloud endpoint is: the local server has one GPU, and main-role calls are legitimately long."""
+        after = SETTINGS.llm_hedge_after_s
+        if after <= 0 or self.role != "extract" or cfg.get("local"):
+            return 0.0
+        b = self.budget
+        if getattr(b, "max_seconds", 0) and b.max_seconds - b.elapsed_s - after < HEDGE_MIN_LEFT_S:
+            return 0.0
+        return after
+
+    def _send(self, cfg: dict, messages: list[dict], **kw) -> tuple[object, dict | None]:
+        """One logical request to one endpoint: (response, hedge info or None).
+
+        A call still running after `_hedge_after` seconds gets ONE duplicate request and the first good answer wins. Measured
+        on 283 live extract calls, the slow ones are provider stalls (4-50 tokens/s against about 109 for a normal call), so
+        a second request usually answers in a few seconds. Rules: a failure BEFORE the hedge time is raised as it always was
+        (the hedge is for slow calls, not a hidden retry); the duplicate has no SDK retries of its own, so one call can never
+        become four requests; both attempts run in daemon threads so an abandoned one cannot keep the process alive; and the
+        whole call is bounded even if the transport never answers."""
+        after = self._hedge_after(cfg)
+        if not after:
+            return self._create_once(cfg, messages, **kw), None
+        timeout, retries = self._call_limits(cfg)
+        cap = (retries + 1) * timeout + after + 1.0
+        b = self.budget
+        if getattr(b, "max_seconds", 0):
+            cap = min(cap, max(3.0, b.max_seconds - b.elapsed_s) + 1.0)
+        box: queue.Queue = queue.Queue()
+
+        def attempt(name: str, sdk_retries: int | None) -> None:
+            try:
+                box.put((name, True, self._create_once(cfg, messages, retries=sdk_retries, **kw)))
+            except Exception as exc:  # noqa: BLE001 — handed to the waiting caller
+                box.put((name, False, exc))
+
+        def launch(name: str, sdk_retries: int | None) -> None:
+            threading.Thread(target=attempt, args=(name, sdk_retries), daemon=True, name=f"llm-attempt-{name}").start()
+
+        t0 = time.monotonic()
+        launch("first", None)
+        hedged = False
+        failed: dict[str, Exception] = {}
+        while True:
+            wait = (cap if hedged else after) - (time.monotonic() - t0)
+            try:
+                name, ok, value = box.get(timeout=max(wait, 0.0))
+            except queue.Empty:
+                if hedged:
+                    raise TimeoutError(f"LLM call to {cfg['model']} got no answer within {cap:.0f}s") from None
+                hedged = True
+                launch("hedge", 0)
+                continue
+            if ok:
+                return value, ({"winner": name, "after_ms": round(after * 1000), "wall_ms": round((time.monotonic() - t0) * 1000)}
+                               if hedged else None)
+            failed[name] = value
+            if not hedged or len(failed) == 2:
+                raise failed["first"]
+
+    def _account_hedge(self, resp, cfg: dict, messages: list[dict], stage: str, info: dict) -> None:
+        """The abandoned request is billed by the provider although nobody reads it: charge it as an ESTIMATE (same prompt,
+        output assumed equal to the winner's) so the Budget can never under-report, and trace it as such."""
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "prompt_tokens", None) or estimate_tokens(json.dumps(messages, default=str))
+        out_tok = getattr(usage, "completion_tokens", None) or 0
+        self._trace("llm_hedge", llm_stage=stage, winner=info["winner"], after_ms=info["after_ms"], wall_ms=info["wall_ms"],
+                    abandoned_input_tokens=in_tok, abandoned_output_tokens=out_tok, estimated=True)
+        self.budget.charge(in_tok, out_tok, model=cfg["model"], role=self.role, stage=f"{stage}#hedge",
+                           provider=cfg["provider"], local=False)
 
     def _call_limits(self, cfg: dict) -> tuple[float, int]:
         """HTTP timeout and SDK retries for ONE call: bounded by the role's cap and by the time the run has left,
@@ -244,16 +329,22 @@ class LLM:
                 self._trace("llm_fallback", llm_stage=stage, skipped=cfg["provider"], reason="circuit open")
                 continue
             t0 = time.time()
+            _HEDGE_TLS.info = None
             try:
                 resp = self._create(cfg, messages, **kw)
                 _breaker_record(cfg["provider"], True)
-                return resp, cfg, round((time.time() - t0) * 1000)
+                ms = round((time.time() - t0) * 1000)
             except Exception as exc:  # noqa: BLE001
                 _breaker_record(cfg["provider"], False)
                 last = exc
                 if i < len(self.targets) - 1:
                     self._trace("llm_fallback", llm_stage=stage, failed=cfg["provider"], error=str(exc)[:160],
                                 next=self.targets[i + 1]["provider"])
+            else:
+                hedge, _HEDGE_TLS.info = getattr(_HEDGE_TLS, "info", None), None
+                if hedge:       # outside the try: a spent budget must stop the run, not be mistaken for a provider failure
+                    self._account_hedge(resp, cfg, messages, stage, hedge)
+                return resp, cfg, ms
         raise LLMError(f"LLM call failed at stage {stage!r}: {last}") from last
 
     def _account(self, resp, cfg: dict, ms: int, *, stage: str, in_est: int, raw: str, **extra) -> None:

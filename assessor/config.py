@@ -69,6 +69,10 @@ class Settings:
     llm_timeout_s: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT_S", 60.0))
     # The high-volume roles (small, extract) normally answer in 2-15 s; a call past this is a stall, not work.
     llm_small_timeout_s: float = field(default_factory=lambda: _env_float("LLM_SMALL_TIMEOUT_S", 30.0))
+    # Page reading (extract role, cloud only): a call still running after this many seconds gets ONE duplicate request and
+    # the first good answer wins. 0 = off. Measured on 283 live calls: p50 5 s, p90 16 s, p99 49 s, and the slow ones are
+    # provider stalls, not long outputs; lowering the timeout instead would lose pages. See llm.py `_send`.
+    llm_hedge_after_s: float = field(default_factory=lambda: _env_float("LLM_HEDGE_AFTER_S", 10.0))
     # Reasoning effort for providers with adaptive thinking (verified on MiniMax). The high-volume roles
     # (small, extract) classify and copy facts; "low" cut their latency and output tokens by more than half
     # with the same answers. Blank = provider default.
@@ -111,7 +115,8 @@ class Settings:
     max_iterations: int = field(default_factory=lambda: _env_int("VRA_MAX_ITERATIONS", 2))      # research passes
     # template = the fixed 9-field checklist (instant, free, auditable); llm = the main model writes the plan.
     planner: str = field(default_factory=lambda: _env("VRA_PLANNER", "template").lower())
-    max_parallel: int = field(default_factory=lambda: _env_int("VRA_MAX_PARALLEL", 4))
+    max_parallel: int = field(default_factory=lambda: _env_int("VRA_MAX_PARALLEL", 4))                # search + download pools
+    llm_parallel: int = field(default_factory=lambda: _env_int("VRA_LLM_PARALLEL", 6))                # pages read at once
     verbose: bool = field(default_factory=lambda: _env("VRA_VERBOSE", "1") == "1")
 
     # --- Service: identity, limits (app/api.py, app/ui.py) -------------------

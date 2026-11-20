@@ -449,7 +449,7 @@ class VendorResearcher:
         self.enable_planner = enable_planner
         self.use_memory = use_memory
         self.max_iterations = max_iterations or SETTINGS.max_iterations
-        self._llm_slots = threading.Semaphore(max(1, SETTINGS.max_parallel))
+        self._llm_slots = threading.Semaphore(max(1, SETTINGS.llm_parallel))     # pages read at once; own knob, see config
 
     def _trace(self, stage: str, **data: Any) -> None:
         if self.tracer:
@@ -1002,7 +1002,11 @@ class VendorResearcher:
             decision = evaluate_progress(plan, profile.facts, iteration=iteration, max_iterations=self.max_iterations,
                                          new_claims=new_claims, budget_reason=budget_reason, corpus_exhausted=self.offline_search)
             left = self._seconds_left()
-            if not budget_reason and not self.offline_search and left is not None and left < MIN_SECONDS_FOR_ITERATION:
+            # Only a run the evaluator wanted to continue is stopped by the clock. If it already said "stop" (iteration cap,
+            # settled evidence, diminishing returns) that reason stands: the old code replaced it with "not enough time for
+            # another pass" although no further pass was allowed, and reported a finished run as stopped early.
+            if (decision.action == "continue" and not budget_reason and not self.offline_search
+                    and left is not None and left < MIN_SECONDS_FOR_ITERATION):
                 budget_reason = f"{left:.0f}s left of the {self.budget.max_seconds:.0f}s time limit: not enough for another pass"
                 decision = evaluate_progress(plan, profile.facts, iteration=iteration, max_iterations=self.max_iterations,
                                              new_claims=new_claims, budget_reason=budget_reason)
