@@ -146,7 +146,8 @@
      },
      "color": {
       "mode": "thresholds"
-     }
+     },
+     "noValue": "no cap set"
     },
     "overrides": []
    },
@@ -208,7 +209,8 @@
      },
      "color": {
       "mode": "thresholds"
-     }
+     },
+     "noValue": "no cap set"
     },
     "overrides": []
    },
@@ -492,7 +494,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum(increase(vra_llm_calls_total{provider=~\"llamacpp|ollama\"}[1h])) / clamp_min(sum(increase(vra_llm_calls_total{provider!=\"mock\"}[1h])), 0.0001)",
+     "expr": "sum(increase(vra_llm_calls_total{provider=~\"llamacpp|ollama\"}[1h])) / clamp_min(sum(increase(vra_llm_calls_total{provider!=\"mock\"}[1h])), 1)",
      "legendFormat": "local share"
     }
    ],
@@ -505,7 +507,9 @@
       "stacking": {
        "mode": "none"
       }
-     }
+     },
+     "min": 0,
+     "max": 1
     },
     "overrides": []
    },

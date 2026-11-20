@@ -91,7 +91,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "vra_local_llm_up",
+     "expr": "vra_local_llm_up and on() (sum(vra_llm_calls_total{provider=~\"llamacpp|ollama\"}) > 0 or sum(vra_llm_fallbacks_total{from_provider=~\"llamacpp|ollama\"}) > 0)",
      "legendFormat": ""
     }
    ],
@@ -112,7 +112,8 @@
      },
      "color": {
       "mode": "thresholds"
-     }
+     },
+     "noValue": "not in use"
     },
     "overrides": []
    },

@@ -253,11 +253,41 @@ improved). Negative results that were measured and not adopted: claim verifiers 
 claims; a multi-agent system with a local router and decision maker failed its holdout gates (79 wrong rows against 3 for the
 baseline); stage-B adjudication with a second model failed. Kaggle data is not in this repository.
 
-**Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
-(Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**. Docker Desktop is now
-installed, and `docker compose config` accepts every profile (checked through the Windows `docker.exe`), but that only proves the
-file parses. Docker Desktop's WSL integration is not enabled for this Ubuntu distro, so `docker` does not work from inside it yet.
-Treat the stack as untested until `make up` and `make up-obs` have run through it, and the `fetcher` sandbox checks have passed.
+**Docker (verified end to end 2026-11-20 on Docker Desktop 29.9.3, WSL2; commands: `make up`, `make up-obs`, `make up-all`).**
+Everything below was run, not just parsed. Findings and fixes first, because testing found three real problems:
+1. **Dashboards unreachable from the host.** Prometheus, Grafana and Jaeger sat only on the `internal: true` `backend` network,
+   and Docker does not publish ports of containers on internal-only networks. Fixed by also attaching them to `edge` (ports stay
+   bound to 127.0.0.1). Side effect: Grafana now has outbound internet (its log shows it trying to reach grafana.com).
+2. **`LocalModelDown` alert was a false alarm** in every deployment without a local model role: `vra_local_llm_up` is 0 until a
+   local provider is used, so the alert sat in "pending" from the first minute. It now fires only when a local provider has been
+   used or has failed over to the cloud. Checked both ways: gauge 1 with the local model serving, expression true after the model
+   was stopped. `promtool check rules` passes.
+3. **Tracing needs port 4318.** The exporter speaks OTLP over HTTP, but `.env.example` suggested 4317 (gRPC). Corrected; with
+   `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` the live assessment shows up in Jaeger with the pipeline spans (`node.route`,
+   `node.vendor_research`, `node.match`, `node.questionnaire`, `node.human_gate`, `node.report`). Tracing is off unless that
+   variable is set.
+
+What was checked and passed: image build; `api`, `ui`, `fetcher` healthy; prod mode (no token 401, wrong token 401); **a full live
+`/assess` through the container (Zoho Desk Zia, T3: 49 s, 11 requirement rows, $0.011, 20 LLM calls)**; the approval gate over
+HTTP (requester approving own request 403, duplicate approver 409, Head of InfoSec then DPO makes it `approved`); the audit hash
+chain (12 records) intact after a full `down` and `up`; tokens, runs, approvals, Grafana login and Prometheus history survive that
+restart (named volumes); fetcher sandbox (uid 10001, read-only root, no capabilities, no API keys, own network) and **SSRF guard:
+loopback, the API's own port, cloud metadata 169.254.169.254, private ranges, IPv6 loopback, `file://`, and integer and hex
+IP encodings are all refused, a public page is fetched**; Prometheus scrapes the API and loads 12 alert rules; the `ApiDown`
+alert actually fired (about 160 s after stopping the API); Grafana login (and `admin/admin` rejected), 3 datasources, 2
+dashboards (panel queries return data after real runs except those for things that did not happen); Loki receives the app log; the `llm` profile on
+the GTX 1650 (about 3.1 GB VRAM, first completion 48 s, no route to the internet from that container); and a small role served by
+the local model (`LLM_SMALL_PROVIDER=llamacpp`) falls back to MiniMax with the model stopped (HTTP 200, 32 s).
+
+**Still not verified or known limits.** There is no Alertmanager, so alerts fire in Prometheus but nobody is notified. Only
+`ApiDown` was seen firing; the other rules were validated by `promtool` only. Both dashboards were opened in headless Chrome and
+looked at (Overview: 20 panels, Cost: 14; nearly all panels populated after real runs; empty by design: "Latest evaluation scorecard", which needs eval
+scores pushed to Prometheus, "Budget stops by limit" and the two cap tiles, because nothing hit or set a limit). That review found and fixed two display defects (the local-vs-cloud share axis
+ran to 10000% because of a near-zero denominator; the cap tiles said only "No data" when no cap is set) and made "Local model up"
+read "not in use" instead of an amber 0 when no local model is configured. The Overview showed a p95 assessment latency of 1.42
+min (about 85 s, amber against the 90 s target) from three container runs of 49 to 76 s. Policy answers through the API take 8 to 27 s; the first `/ready` after a fresh volume takes about 12 s
+(model download). A request that falls back from a dead local model costs about 30 s. The image was built for one machine type,
+the CI docker-build job has not been seen to run, and `docker compose` here goes through the Windows CLI.
 
 **Checks.** `LLM_PROVIDER=mock SEARCH_PROVIDER=offline python -m pytest -q`, also with `EMBEDDER=builtin RERANKER=builtin`,
 then `python eval/run_eval.py --strict --real --ablations`.

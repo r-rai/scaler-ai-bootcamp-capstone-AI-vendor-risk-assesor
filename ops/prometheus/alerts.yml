@@ -47,7 +47,12 @@ groups:
         annotations: {summary: "Many rejected API tokens: possible credential guessing."}
 
       - alert: LocalModelDown
-        expr: vra_local_llm_up == 0
+        # vra_local_llm_up is 0 by default, so without the `and` this fired in every deployment that has no local role.
+        # It only counts when a local provider has been used (calls) or has failed over to the cloud (fallbacks).
+        expr: >
+          vra_local_llm_up == 0
+          and on() (sum(vra_llm_calls_total{provider=~"llamacpp|ollama"}) > 0
+                    or sum(vra_llm_fallbacks_total{from_provider=~"llamacpp|ollama"}) > 0)
         for: 5m
         labels: {severity: warning}
         annotations: {summary: "The local model is down; small-model calls are falling back to the cloud provider (costs money)."}

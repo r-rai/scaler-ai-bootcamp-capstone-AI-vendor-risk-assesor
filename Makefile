@@ -25,11 +25,11 @@ audit:        ## verify the hash-chained audit log
 	$(PY) scripts/verify_audit.py
 llm:          ## serve the local small model with llama.cpp on :8080 (foreground)
 	scripts/serve_local_llm.sh
-up:           ## api + ui + sandboxed fetcher (Docker, unverified)
+up:           ## api + ui + sandboxed fetcher (Docker; verified 2026-11-20)
 	docker compose up -d --build
-up-obs:       ## ... plus Prometheus, Grafana, Loki, Jaeger (Docker, unverified)
+up-obs:       ## ... plus Prometheus, Grafana, Loki, Jaeger (Docker; verified 2026-11-20, needs GRAFANA_PASSWORD)
 	docker compose --profile obs up -d --build
-up-all:       ## ... plus the local LLM container (Docker + GPU, unverified)
+up-all:       ## ... plus the local LLM container (Docker + GPU; verified 2026-11-20)
 	docker compose --profile llm --profile obs up -d --build
 down:         ## stop the stack
 	docker compose --profile llm --profile obs down
