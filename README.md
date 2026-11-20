@@ -205,6 +205,54 @@ sub-processor list passes), AI-2.1 for OpenAI (PASS resting on a third-party cla
 (FAIL because the page does not mention SSO). Limits: one run per vendor; live runs are non-deterministic; the web has moved
 since 2026-11-01 (Lorikeet DP-5.4 may be drift: the vendor states 60 days, the gold set says PASS). The gold set was not edited.
 
+**Final live run (2026-11-20, code `2130b77`; same harness, same gold set, Tavily + Firecrawl read-through, caches off).**
+Everything below is as measured; the 80% gate was **not** met.
+
+| Gate (pre-registered) | Result | |
+|---|---|---|
+| Correct cells >= 64/80 (80%) | **38/80 = 47.5%** | FAIL |
+| Guesses (PASS/FAIL where gold says NEEDS_REVIEW) = 0 | 0 | PASS |
+| False PASS on a gold-FAIL cell = 0 | 1 (OpenAI DP-3.1) | FAIL |
+| Every run inside 90 s, no deadline hit | median 50 s (in-run, upper median 54.8 s), max 69 s | PASS |
+| Integrity (provider as configured, no local model, no key in files) | OK | PASS |
+
+Progress on the same ten vendors: 32/80 (2026-11-20 re-measure of the baseline code), 38/80 (final). Only about one cell of the
+gain is attributable to the matcher changes of this session (the guess guard); the rest is live variance (the web and the
+extractor change between runs), so a gain of under about 4 cells should not be read as an improvement. Cost $0.13, 155 Tavily
+searches.
+
+**Why 80% is out of reach here.** The 42 misses by cause: not found on any page read 15; certificate stated without a date 5
+(the public pages say "SOC 2 Type II certified" and nothing else, so a dated, documented certificate does not exist to find);
+wrong value 4; about 12 cells where the rules send the vendor to a person although the gold says PASS: SEC-9.3 (real
+security-incident search results name Zoho, LiveKit, Notion, Anthropic and OpenAI), AI-3.4 (a third-party model provider is
+listed), DP-5.4 (retention terms), DP-2.2 ("DPA on request"); and 6 more spread over unknown-by-rule, conflicting-source and SEC-9.3 cells that could not be established. Those are the policy working as designed against a gold set that
+is optimistic: the gold is 65 PASS, 10 NEEDS_REVIEW and 5 FAIL, so a system that always answered PASS would score 81%. Moving the
+rules to match the gold would be tuning to the data, so it was not done. The achievable ceiling without that is about 51/80 (64%).
+
+**Known problems, not hidden.**
+- OpenAI DP-3.1 is a false PASS: a *claimed* (confidence 0.43) fact from `openai.com/business-data` lists India. The gold says
+  FAIL, which is probably stale because OpenAI now states India residency; this is unverified. A "documented evidence only" rule
+  for DP-3.1 would remove it but cost about 4 correct cells, so it is left off.
+- SEC-9.3 has a bounded "searched, nothing found" rule (`assessor/incident_scan.py`). It produced **no** PASS in the final run,
+  so its safety on real PASS cells is unverified.
+- Commit `c1cfeb3` (after the final run) makes a page's "no incidents disclosed" pass only when the incident search also came back
+  clean. Rescoring the final profiles is unchanged (they carry no search record); the expected live effect is -2 cells (38 -> 36)
+  and it has **not** been measured live.
+- The extractor reads only the first 12,000 characters of a page (`EXTRACT_WINDOW_CHARS`); 22% of fetched characters are never
+  shown to the model. A 20,000-character window failed its pre-registered stability gate and was not adopted.
+- Extraction is noisy: 17.6% of claim elements differ between two identical runs.
+- One run per vendor; live results are not reproducible cell for cell. The CLI cold start (1 to 9 s) is not in the in-run times.
+
+**Latency work.** Slow runs came from single stalled extraction calls, not from search. The fix is a hedged duplicate request
+after 10 s for extraction calls on cloud models and 6 page-reading slots (`LLM_HEDGE_AFTER_S`, `VRA_LLM_PARALLEL`; set to 0 and 4
+to switch off). Tail of extract calls: p99 36.0 s (was 43.0 s), max 36.9 s (was 51.7 s); p95 got worse (21.0 s vs 17.9 s), so no
+p95 gain is claimed.
+
+**Kaggle "Vendor Verdict" (separate task).** Best submission 0.99881 (about 2 to 4 wrong rows; rank 12th to 15th as others
+improved). Negative results that were measured and not adopted: claim verifiers (grounding, NLI, zero-shot) rejected correct
+claims; a multi-agent system with a local router and decision maker failed its holdout gates (79 wrong rows against 3 for the
+baseline); stage-B adjudication with a second model failed. Kaggle data is not in this repository.
+
 **Docker.** `Dockerfile`, `docker-compose.yml` (`api`, `ui`, `llm`, `fetcher` sandbox, `obs` profile) and `ops/`
 (Prometheus alerts, Grafana dashboards, Loki, promtail) are written but **have not been built or run**. Docker Desktop is now
 installed, and `docker compose config` accepts every profile (checked through the Windows `docker.exe`), but that only proves the
