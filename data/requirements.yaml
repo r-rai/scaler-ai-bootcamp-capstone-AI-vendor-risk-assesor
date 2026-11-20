@@ -89,6 +89,7 @@ requirements:
     params:
       review_if_category: ["model_provider"]  # a third-party model provider needs its own AI-2.1 check
       require_documented: true                # a list quoted from an FAQ or marketing page may be a subset
+      require_list_page: true                 # and a PASS needs a source that is a sub-processor page, not a terms page that names one processor
     severity: major
     applies_when: { tiers: ["T2", "T3"] }
 
@@ -143,6 +144,7 @@ requirements:
       pass:   ["yes"]
       review: ["on_request"]
       fail:   ["no"]
+      conditional_review: true                # "signed when required" is availability on a condition: on request, not yes
     severity: blocker
     applies_when: { tiers: ["T3"] }
 

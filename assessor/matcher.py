@@ -153,6 +153,10 @@ def rule_enum_verdict(req: Requirement, fact: Optional[VendorFact], ctx: dict) -
         # Who said it matters for a blocker: a forum post, review or third-party write-up may not decide PASS or FAIL.
         return "NEEDS_REVIEW", (f"{fact.display}. Only {fact.evidence_level} evidence (a decision here needs "
                                 f"{' or '.join(decisive)}); confirm with the vendor's own terms.")
+    if v in p.get("pass", []) and p.get("conditional_review") and _CONDITIONAL.search(fact.display or ""):
+        # "A DPA is signed when required" is availability on a condition: by the enum's own meaning that is `on_request`, not `yes`.
+        return "NEEDS_REVIEW", (f"{fact.display}. Stated as conditional, so treated as available on request, not unconditionally; "
+                                f"record how the condition is met ({req.clause}).")
     if v in p.get("pass", []):
         return "PASS", fact.display
     if v in p.get("review", []):
@@ -160,6 +164,14 @@ def rule_enum_verdict(req: Requirement, fact: Optional[VendorFact], ctx: dict) -
     if v in p.get("fail", []):
         return "FAIL", fact.display
     return "UNKNOWN", f"Unrecognised value {v!r}; check the extraction."
+
+
+# Availability that depends on a condition. Deliberately NOT "as required (by law)", which says why a DPA exists, not when it is offered.
+_CONDITIONAL = re.compile(
+    r"\b(?:when|if|where|whenever)\s+(?:required|needed|necessary|applicable|requested)\b|\b(?:upon|on|by)\s+request\b|\bon demand\b"
+    r"|\b(?:can|may|could)\s+be\s+requested\b", re.I)
+# The page a sub-processor list came from names itself a sub-processor page (host, path, query or fragment).
+_SUBPROCESSOR_PAGE = re.compile(r"sub[-_ ]?processors?", re.I)
 
 
 # A sub-processor that runs or serves a language model is a model provider whatever category the extractor gave it
@@ -189,6 +201,12 @@ def rule_list_disclosed(req: Requirement, fact: Optional[VendorFact], ctx: dict)
         # A list quoted from an FAQ, trust summary or marketing page may be one product's subset, not the published list.
         return "NEEDS_REVIEW", (f"{len(fact.value)} sub-processor(s) found, but only as a {fact.evidence_level} statement, not on the "
                                 "vendor's published sub-processor list. Confirm the list is complete.")
+    if req.params.get("require_list_page", False) and not any(_SUBPROCESSOR_PAGE.search(u) for u in fact.sources):
+        # "Documented" only says the vendor's own legal page; a terms or privacy page that names a processor in passing is not the published
+        # list, and its length says nothing about the list being complete.
+        where = fact.sources[0] if fact.sources else "an unknown page"
+        return "NEEDS_REVIEW", (f"{len(fact.value)} sub-processor(s) found, but only in {where}, which is not a published sub-processor list. "
+                                "Ask the vendor for its list.")
     return "PASS", f"{len(fact.value)} sub-processors disclosed; no third-party model provider."
 
 
