@@ -61,7 +61,7 @@ Each assessment writes `runs/<timestamp>-assess/`:
 Tests and evaluation:
 
 ```bash
-python -m pytest -q              # 1478 tests (1477 pass, 2 skip without fastapi)
+python -m pytest -q              # 1492 tests (1490 pass, 2 skip without fastapi)
 python eval/run_eval.py          # scorecard against data/gold_set.json → reports/eval_report.md
 python eval/run_eval.py --strict # exit 1 on a failed threshold (use in CI)
 ```
