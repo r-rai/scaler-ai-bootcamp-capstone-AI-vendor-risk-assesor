@@ -186,6 +186,32 @@ def test_trace_markdown_lists_each_handover_with_its_counts():
     assert "c9999" in md and "grader → decision_maker" in md and "conflicts=2" in md
 
 
+def test_trace_markdown_prints_recorded_tokens():
+    t = Trace("c9999"); t.handover("grader", "decision_maker", {"conflicts": 2}, tokens_in=7, tokens_out=3, seconds=0.25)
+    md = t.to_markdown()
+    assert "(7 in / 3 out tokens, 0.25 s)" in md and "Total: 1 handovers, 7 in / 3 out tokens, 0.25 s" in md
+
+
+def test_trace_markdown_prints_no_zero_tokens_when_none_were_recorded():
+    # R56: per-node tokens are not recorded by the runtime (run.json `roles` holds per-role totals); a trace must not claim 0 tokens
+    t = Trace("c9999")
+    t.handover("planner", "plan_reviewer", {"pages": 3}, seconds=1.5)
+    t.handover("plan_reviewer", "router", {"fixes": 1})
+    md = t.to_markdown()
+    assert "tokens" not in md and "0 in" not in md and "0 out" not in md
+    assert "planner → plan_reviewer: pages=3 (1.50 s)" in md and "Total: 2 handovers, 1.50 s" in md
+    assert t.to_json()["handovers"][0]["tokens_in"] == 0 and t.to_json()["totals"]["tokens_out"] == 0     # the JSON keeps its fields
+
+
+def test_trace_markdown_prints_tokens_only_on_the_handovers_that_have_them():
+    t = Trace("c9999")
+    t.handover("planner", "plan_reviewer", {"pages": 3}, seconds=1.0)
+    t.handover("specialist", "grader", {"readings": 2}, tokens_in=0, tokens_out=4, seconds=0.5)
+    lines = t.to_markdown().splitlines()
+    assert lines[2].endswith("(1.00 s)") and lines[3].endswith("(0 in / 4 out tokens, 0.50 s)")
+    assert lines[-1] == "Total: 2 handovers, 0 in / 4 out tokens, 1.50 s"
+
+
 def test_trace_deepcopies_and_pickles():
     t = Trace("c9999"); t.handover("router", "specialist", {"pages": 4}, tokens_in=5)
     for clone in (copy.deepcopy(t), pickle.loads(pickle.dumps(t))):

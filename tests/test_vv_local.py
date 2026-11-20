@@ -381,6 +381,20 @@ def _claims(cid):
     }
 
 
+SC_BASELINE_PROMPT = "Invented baseline extraction prompt for the selfcheck tests (not the submitted one)."
+
+
+@pytest.fixture
+def no_git_baseline(monkeypatch):
+    """R58: the selfcheck tests never touch git history (a depth-1 CI clone has none). The real `selfcheck` still recovers the prompt
+    from git through `baseline_mod.baseline_prompt`; here that returns an invented text and any git recovery raises, so a test that
+    still reached git history would fail on a full clone too."""
+    def no_history(*a, **k):
+        raise AssertionError("a selfcheck test tried to recover a prompt from git history")
+    monkeypatch.setattr(kp, "prompt_text_from_git", no_history)
+    monkeypatch.setattr(baseline_mod, "baseline_prompt", lambda: SC_BASELINE_PROMPT)
+
+
 def write_selfcheck_data(d: Path, model: str, missing_case=None, page_text="") -> Path:
     write_data(d, split="train", page_text=page_text or None)
     # the sub-processor sentence the claims quote
@@ -393,7 +407,7 @@ def write_selfcheck_data(d: Path, model: str, missing_case=None, page_text="") -
     (d / "pages.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     cache = d / "cache" / "extract"
     cache.mkdir(parents=True)
-    system = baseline_mod.baseline_prompt()
+    system = SC_BASELINE_PROMPT                                     # the text `no_git_baseline` injects
     for line in lines:
         p = json.loads(line)
         cid, s = p["case_id"], p["page_id"].rsplit("_", 1)[1]
@@ -423,6 +437,7 @@ def _check(d, model="stub-baseline", **kw):
     return res, lines
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_selfcheck_replays_the_baseline_rows(tmp_path):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline")
     files = sorted(p.relative_to(d) for p in d.rglob("*"))
@@ -434,6 +449,7 @@ def test_selfcheck_replays_the_baseline_rows(tmp_path):
     assert any(line.startswith("selfcheck OK") for line in lines)
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_selfcheck_skips_a_case_without_a_baseline_cache(tmp_path):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline", missing_case="c0003")
     res, lines = _check(d)
@@ -441,12 +457,14 @@ def test_selfcheck_skips_a_case_without_a_baseline_cache(tmp_path):
     assert any("no baseline cache" in line and "c0003" in line for line in lines)
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_selfcheck_with_no_covered_case_fails(tmp_path):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline")
     res, _ = _check(d, model="another-model")                                    # a wrong model name: no case has a cache
     assert res["cases_run"] == 0 and res["exit"] != 0
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_an_unexpected_stub_request_fails_the_selfcheck(tmp_path, monkeypatch):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline")
     real = selfcheck.LocalStub.structured
@@ -458,6 +476,7 @@ def test_an_unexpected_stub_request_fails_the_selfcheck(tmp_path, monkeypatch):
     assert res["unexpected"] > 0 and res["exit"] != 0 and any(line.startswith("selfcheck FAILED") for line in lines)
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_a_network_attempt_fails_the_selfcheck(tmp_path, monkeypatch):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline")
     real = selfcheck.PlannerStub.structured
@@ -476,6 +495,7 @@ def test_a_network_attempt_fails_the_selfcheck(tmp_path, monkeypatch):
     assert res["network"] == 2 and res["exit"] != 0                            # one planner call per dev case
 
 
+@pytest.mark.usefixtures("no_git_baseline")
 def test_selfcheck_prints_no_page_text(tmp_path, capsys):
     d = write_selfcheck_data(tmp_path / "data", "stub-baseline", page_text=CANARY)
     res, lines = _check(d)

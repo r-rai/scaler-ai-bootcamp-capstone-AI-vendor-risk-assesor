@@ -7,6 +7,7 @@ import copy
 import csv
 import json
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -612,12 +613,54 @@ def test_cases_cancelled_by_a_stop_are_unfinished_not_errors(tmp_path):
     assert rj["cases"]["finished"] + rj["cases"]["unfinished"] == 3 and "c0001" in rj["unfinished_case_ids"]
 
 
-def test_a_stop_ends_the_cases_in_flight_at_their_next_model_call(tmp_path):
-    # c0001 hits the budget after 0.1 s; c0002 runs alongside, 0.05 s per read over 9 reads, so it is still reading at the stop
-    reader = ReaderLLM(raise_on={"c0001": BudgetExceeded("budget")}, delay={"c0001": 0.1, "c0002": 0.05})
+class StopOrderedReader(ReaderLLM):
+    """M-i: orders a stop by events instead of wall-clock delays. The `trigger` case raises `exc` on its page reads once every case in
+    `wait_for` has started a page read; every other case's read is held until the run's own stop event is set (`stop_box`, filled
+    by `capture_run_stop`) and then answers, so its NEXT model call is the first one the stopping run refuses. No sleep, no race:
+    a slow main thread only makes the held reads wait longer. A wait that times out is recorded in `timed_out` (a test failure)."""
+
+    def __init__(self, trigger: str, exc: BaseException, stop_box: list, wait_for=(), timeout: float = 10.0):
+        super().__init__()
+        self.trigger, self.exc, self.stop_box, self.timeout = trigger, exc, stop_box, timeout
+        self.started = {c: threading.Event() for c in wait_for}
+        self.held: list[str] = []
+        self.timed_out = False
+
+    def structured(self, system, user, schema, stage="", **kw):
+        cid = next(c for c in CASE_IDS if f" Case {c} page." in user)
+        if cid in self.started:
+            self.started[cid].set()
+        if cid == self.trigger:
+            if not all(e.wait(self.timeout) for e in self.started.values()):
+                self.timed_out = True
+            raise self.exc
+        self.held.append(cid)
+        if not self.stop_box[0].wait(self.timeout):
+            self.timed_out = True
+        return super().structured(system, user, schema, stage=stage, **kw)
+
+
+@pytest.fixture
+def capture_run_stop(monkeypatch):
+    """The run's own stop event (`runner.run` hands it to its QuotaGate), in a one-item list."""
+    box: list = []
+
+    class CapturingGate(runner.QuotaGate):
+        def __init__(self, *a, stop, **kw):
+            box.append(stop)
+            super().__init__(*a, stop=stop, **kw)
+    monkeypatch.setattr(runner, "QuotaGate", CapturingGate)
+    return box
+
+
+def test_a_stop_ends_the_cases_in_flight_at_their_next_model_call(tmp_path, capture_run_stop):
+    # c0001 hits the budget only once c0002 is reading; c0002's read is held until the run has stopped, then its next call is refused
+    reader = StopOrderedReader("c0001", BudgetExceeded("budget"), capture_run_stop, wait_for=("c0002",))
     out = run_fixture(tmp_path, reader=reader, workers=2)
     rj = run_json(out)
+    assert not reader.timed_out and "c0002" in reader.held                                  # c0002 was in flight at the stop
     assert rj["stopped"] == "budget" and "c0002" in rj["unfinished_case_ids"] and rj["cases"]["finished"] == 0
+    assert not (out / "traces" / "c0002.json").exists()
 
 
 @pytest.mark.parametrize("kind,reason", [("pages", "failed_pages"), ("budget", "budget"), ("interrupt", "interrupted")])
@@ -631,11 +674,13 @@ def test_stopped_reason(tmp_path, kind, reason):
         assert not (tmp_path / "out" / "traces" / "c0002.json").exists()
 
 
-def test_stop_exceptions_is_the_seam(tmp_path, monkeypatch):
+def test_stop_exceptions_is_the_seam(tmp_path, monkeypatch, capture_run_stop):
     class Quota(Exception):
         pass
     monkeypatch.setattr(runner, "STOP_EXCEPTIONS", (BudgetExceeded, Quota))
-    rj = run_json(run_fixture(tmp_path, reader=ReaderLLM(raise_on={"c0001": Quota()}), workers=1))
+    reader = StopOrderedReader("c0001", Quota(), capture_run_stop)          # a case the worker starts after c0001 is held until the stop
+    rj = run_json(run_fixture(tmp_path, reader=reader, workers=1))
+    assert not reader.timed_out
     assert rj["partial"] is True and rj["case_errors"] == {} and rj["stopped_reason"] == "quota" and rj["cases_done"] == 0
 
 

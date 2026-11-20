@@ -1,9 +1,14 @@
-"""The handover trace of one case: which agent passed what to which agent, with tokens and seconds.
+"""The handover trace of one case: which agent passed what to which agent, with seconds (tokens: see the last paragraph).
 
 Summaries are meant to hold counts and ids only, never page text. `handover` enforces that on a best-effort basis and never
 raises: a string longer than MAX_SUMMARY_STR is replaced by a `<text:N chars>` placeholder and an odd type is coerced or replaced
 by a `<TypeName>` placeholder, so a stray model-derived value can neither leak competition text into a trace nor crash a run.
-This is a heuristic, not a guarantee: a short quote still passes."""
+This is a heuristic, not a guarantee: a short quote still passes.
+
+Tokens per handover are NOT recorded by the runtime (ruling R56): parallel cases share the global per-role counters, so a per-node
+delta would need new plumbing. Every handover therefore carries tokens_in = tokens_out = 0 in the JSON (the fields stay), the
+Markdown prints seconds only for a handover (and a total) with no recorded tokens, and the per-role token totals are in run.json
+`roles` (estimates for cached calls)."""
 from __future__ import annotations
 
 import enum
@@ -78,8 +83,15 @@ class Trace:
         lines = [f"# Handover trace: {self.case_id}", ""]
         for i, h in enumerate(data["handovers"], 1):
             counts = ", ".join(f"{k}={v}" for k, v in h["summary"].items()) or "-"
-            lines.append(f"{i}. {h['agent']} → {h['to']}: {counts} "
-                         f"({h['tokens_in']} in / {h['tokens_out']} out tokens, {h['seconds']:.2f} s)")
+            lines.append(f"{i}. {h['agent']} → {h['to']}: {counts} ({_cost(h)})")
         t = data["totals"]
-        lines += ["", f"Total: {t['handovers']} handovers, {t['tokens_in']} in / {t['tokens_out']} out tokens, {t['seconds']:.2f} s"]
+        lines += ["", f"Total: {t['handovers']} handovers, {_cost(t)}"]
         return "\n".join(lines) + "\n"
+
+
+def _cost(rec: dict) -> str:
+    """"N in / M out tokens, S s", or "S s" alone when no token was recorded (R56: the runtime records none per handover)."""
+    seconds = f"{rec['seconds']:.2f} s"
+    if not (rec["tokens_in"] or rec["tokens_out"]):
+        return seconds
+    return f"{rec['tokens_in']} in / {rec['tokens_out']} out tokens, {seconds}"
