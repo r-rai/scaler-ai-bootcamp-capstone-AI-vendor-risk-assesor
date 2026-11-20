@@ -276,6 +276,7 @@ def _clean_remote_page(data: Any, url: str) -> dict[str, Any]:
 # Firecrawl read-through (only when the vendor's own site refused our honest fetcher)
 # ---------------------------------------------------------------------------
 
+THIN_PAGE_CHARS = 300                         # a 200 answer with less text than this on the vendor's own site is a JS shell, not a page
 FALLBACK_STATUSES = (401, 403, 429, 503)      # what a site answers a bot it does not want; a 404 is not one of them
 FIRECRAWL_URL = "https://api.firecrawl.dev/v2/scrape"
 FIRECRAWL_MIN_TIME_LEFT_S = 5.0
@@ -287,7 +288,8 @@ def _on_domain(url: str, domain: Optional[str]) -> bool:
     return bool(d) and (host == d or host.endswith("." + d))
 
 
-def _read_through_firecrawl(url: str, refused: FetchError, official_domain: Optional[str], budget: Any) -> dict[str, Any]:
+def _read_through_firecrawl(url: str, refused: FetchError, official_domain: Optional[str], budget: Any,
+                            *, thin: bool = False) -> dict[str, Any]:
     """The direct download was refused. Either re-raise `refused` untouched (the fallback does not apply) or return the
     page read through Firecrawl, or raise a FetchError that still names the original refusal.
 
@@ -299,7 +301,7 @@ def _read_through_firecrawl(url: str, refused: FetchError, official_domain: Opti
 
     from . import costs
 
-    if refused.status not in FALLBACK_STATUSES or not firecrawl_available():
+    if (refused.status not in FALLBACK_STATUSES and not thin) or not firecrawl_available():
         raise refused
 
     def skipped(why: str) -> FetchError:
@@ -351,11 +353,15 @@ def _read_through_firecrawl(url: str, refused: FetchError, official_domain: Opti
 
 
 def fetch(url: str, *, refresh: bool = False, vendor: str = "", run_id: str = "",
-          official_domain: Optional[str] = None, budget: Any = None) -> dict[str, Any]:
+          official_domain: Optional[str] = None, budget: Any = None, probe: bool = False) -> dict[str, Any]:
     """Cache → sandboxed fetcher (if configured) → local guarded download. Adds `from_cache`.
 
     `official_domain` and `budget` are only needed for the Firecrawl read-through, which a refused local download may
-    fall back to (never in sandbox mode); without them a refusal is simply an error."""
+    fall back to (never in sandbox mode); without them a refusal is simply an error. A `probe` (a guessed path, most of
+    which 404) never uses Firecrawl: a credit is not spent on a page that probably does not exist.
+
+    A direct download that succeeded but holds under THIN_PAGE_CHARS of text (a JS-only trust page) on a non-probe,
+    non-PDF URL is read once through Firecrawl too; the longer text wins and any failure keeps the original page."""
     from .cache import get_cache
 
     cache = get_cache()
@@ -380,7 +386,18 @@ def fetch(url: str, *, refresh: bool = False, vendor: str = "", run_id: str = ""
         try:
             page = safe_fetch(url)
         except FetchError as refused:
+            if probe:
+                raise
             page = _read_through_firecrawl(url, refused, official_domain, budget)
+        else:
+            if (not probe and len(page["text"].strip()) < THIN_PAGE_CHARS and "pdf" not in str(page.get("content_type", "")).lower()
+                    and firecrawl_available()):
+                try:
+                    richer = _read_through_firecrawl(url, FetchError("thin page", status=200), official_domain, budget, thin=True)
+                    if len(richer["text"].strip()) > len(page["text"].strip()):
+                        page = richer
+                except FetchError:
+                    pass
     if page["text"].strip():
         cache.put("page", url, page, ttl=SETTINGS.page_cache_ttl_s, tag=vendor)
     return {**page, "from_cache": False}

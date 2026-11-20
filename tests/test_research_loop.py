@@ -55,7 +55,7 @@ class StubWeb:
         return [{"url": u, "title": PAGES.get(u, ("", None, ""))[0] or u, "snippet": "Acme AI " + query[:40], "rank": i, "query": query,
                  "provider": "stub", "retrieved_at": "2026-11-01T00:00:00+00:00"} for i, u in enumerate(urls, 1)]
 
-    def fetch(self, url, *, refresh=False, vendor="", run_id=""):
+    def fetch(self, url, *, refresh=False, vendor="", run_id="", probe=False):
         fetching.check_url(url, resolve=False)
         self.fetched.append(url)
         if url not in PAGES:

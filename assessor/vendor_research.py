@@ -550,7 +550,7 @@ class VendorResearcher:
             self.budget.charge_tool("fetch", "sandbox" if SETTINGS.fetcher_url else "local")
             # The read-through context is only handed over when the fallback can run, so the call keeps its old shape otherwise.
             context = {"official_domain": official_domain, "budget": self.budget} if fetching.firecrawl_available() else {}
-            page = fetching.fetch(url, refresh=run.refresh, vendor=vendor, run_id=self._run_id, **context)
+            page = fetching.fetch(url, refresh=run.refresh, vendor=vendor, run_id=self._run_id, **({"probe": True} if probe else {}), **context)
         except fetching.UnsafeURL as exc:
             self._trace("ssrf_blocked", url=url, reason=str(exc)[:120])
             return None

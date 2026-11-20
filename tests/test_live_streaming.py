@@ -45,7 +45,7 @@ class Web:
         return [{"url": u, "title": u, "snippet": "StreamCo", "rank": i, "query": query, "provider": "stub",
                  "retrieved_at": "2026-11-01T00:00:00+00:00"} for i, u in enumerate(urls, 1)]
 
-    def fetch(self, url, *, refresh=False, vendor="", run_id=""):
+    def fetch(self, url, *, refresh=False, vendor="", run_id="", probe=False):
         fetching.check_url(url, resolve=False)
         if url in self.slow_fetch:
             time.sleep(self.slow_fetch[url])
